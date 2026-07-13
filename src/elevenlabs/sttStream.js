@@ -13,7 +13,7 @@ export class ElevenLabsSTT {
 
   connect() {
     this.isClosedExplicitly = false;
-    const url = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en&audio_format=ulaw_8000&commit_strategy=vad&vad_silence_threshold_secs=1.2&vad_threshold=0.6&min_volume_threshold=0.25`;
+    const url = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en&audio_format=ulaw_8000&commit_strategy=vad&vad_silence_threshold_secs=0.6&vad_threshold=0.6&min_volume_threshold=0.25`;
     console.log(`[STT] Connecting to URL: ${url}`);
     this.ws = new WebSocket(url, { headers: { 'xi-api-key': this.apiKey } });
 

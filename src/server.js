@@ -40,6 +40,7 @@ const FILLERS = [
   "Sure, let me look at that."
 ];
 const fillerCache = {};
+const prewarmed = new Map();
 
 async function prewarmFillers(apiKey, voiceId) {
   console.log('[Filler Cache] Pre-warming fillers...');
@@ -76,6 +77,19 @@ fastify.all('/voice', (req, reply) => {
     reply.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>`);
     return;
+  }
+
+  const callSid = req.body?.CallSid || req.query?.CallSid;
+  if (callSid) {
+    console.log(`[Pre-warm] Initializing ElevenLabs streams early for CallSid: ${callSid}`);
+    const stt = new ElevenLabsSTT({ apiKey: process.env.ELEVENLABS_API_KEY });
+    const tts = new ElevenLabsTTS({
+      apiKey: process.env.ELEVENLABS_API_KEY,
+      voiceId: process.env.ELEVENLABS_VOICE_ID
+    });
+    stt.connect();
+    const ttsPromise = tts.connect();
+    prewarmed.set(callSid, { stt, tts, ttsPromise });
   }
 
   reply.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -118,116 +132,121 @@ fastify.register(async (f) => {
       if (data.event === 'start') {
         startEventTime = Date.now();
         streamSid = data.start.streamSid;
-        fastify.log.info({ streamSid }, 'call started');
+        const callSid = data.start.callSid;
+        fastify.log.info({ streamSid, callSid }, 'call started');
 
-        // 1. Start STT
-        stt = new ElevenLabsSTT({
-          apiKey: process.env.ELEVENLABS_API_KEY,
-          onTranscript: async (text, isFinal) => {
-            if (!isFinal) {
-              if (isGreeting) return; // NEVER barge-in during greeting
-              if (!isSpeaking) return;
-              if (Date.now() < bargeInLockUntil) return;
-              if (Date.now() - lastBotFinish < 600) return;
+        const pre = prewarmed.get(callSid);
+        if (pre) {
+          console.log(`[Pre-warm] Using pre-warmed streams for CallSid: ${callSid}`);
+          stt = pre.stt;
+          tts = pre.tts;
+          prewarmed.delete(callSid);
+        } else {
+          console.log(`[Pre-warm] No pre-warmed streams found for CallSid: ${callSid}. Creating new ones...`);
+          stt = new ElevenLabsSTT({ apiKey: process.env.ELEVENLABS_API_KEY });
+          stt.connect();
+          tts = new ElevenLabsTTS({
+            apiKey: process.env.ELEVENLABS_API_KEY,
+            voiceId: process.env.ELEVENLABS_VOICE_ID
+          });
+          await tts.connect();
+        }
 
-              // Track start of speech for debouncing
-              if (speechStart === 0) {
-                speechStart = Date.now();
-              }
+        // Dynamically configure STT callback
+        stt.onTranscript = async (text, isFinal) => {
+          if (!isFinal) {
+            if (isGreeting) return; // NEVER barge-in during greeting
+            if (!isSpeaking) return;
+            if (Date.now() < bargeInLockUntil) return;
+            if (Date.now() - lastBotFinish < 600) return;
 
-              if (text.length > 12 && Date.now() - speechStart > 800) {
-                // Ignore backchannels and short partials
-                const lower = text.toLowerCase().trim();
-                if (['mm', 'yeah', 'okay', 'uh', 'hmm', 'ah'].includes(lower)) return;
-                if (text.trim().split(/\s+/).length < 2) return; // need at least 2 words
-
-                console.log(`[Barge-in] "${text}"`);
-                bargeInLockUntil = Date.now() + 800;
-                turnId++; // Cancel current LLM turn
-                aborter?.abort();
-                twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
-                tts?.interrupt(false); // Soft interrupt (flushes generator but keeps socket open)
-                isSpeaking = false;
-              }
-              return;
+            // Track start of speech for debouncing
+            if (speechStart === 0) {
+              speechStart = Date.now();
             }
 
-            // Final committed transcript
-            if (isProcessing) return;
-            isProcessing = true;
-            speechStart = 0; // Reset speech tracker
+            if (text.length > 12 && Date.now() - speechStart > 800) {
+              // Ignore backchannels and short partials
+              const lower = text.toLowerCase().trim();
+              if (['mm', 'yeah', 'okay', 'uh', 'hmm', 'ah'].includes(lower)) return;
+              if (text.trim().split(/\s+/).length < 2) return; // need at least 2 words
 
-            const myTurn = ++turnId;
-            aborter?.abort();
-            aborter = new AbortController();
-            currentTurnStartTime = Date.now();
-            firstAudioTimeLogged = false;
-            
-            // Reset TTS interrupt/ignore audio state for the new turn
-            tts?.clearInterrupt();
-            
-            // Truncate conversation to keep history short and context clean (last 12 messages)
-            if (conversation.length > 12) {
-              conversation = [
-                conversation[0], // Keep system prompt
-                ...conversation.slice(-11)
-              ];
+              console.log(`[Barge-in] "${text}"`);
+              bargeInLockUntil = Date.now() + 800;
+              turnId++; // Cancel current LLM turn
+              aborter?.abort();
+              twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+              tts?.interrupt(false); // Soft interrupt (flushes generator but keeps socket open)
+              isSpeaking = false;
             }
-            
-            conversation.push({ role: 'user', content: text });
-            console.log(`[STT] Final: "${text}"`);
-
-            /*
-            // Send a pre-warmed voice filler instantly to Twilio
-            const randomFiller = FILLERS[Math.floor(Math.random() * FILLERS.length)];
-            const cachedAudio = fillerCache[randomFiller];
-            if (cachedAudio) {
-              console.log(`[Filler] Playing cached: "${randomFiller}"`);
-              isSpeaking = true;
-              twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: cachedAudio } }));
-              // Send mark for the filler
-              currentMarkName = `filler-${Date.now()}`;
-              twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: currentMarkName } }));
-            } else {
-              console.log(`[Filler] Cache miss, playing text: "${randomFiller}"`);
-              tts.sendTextChunk(randomFiller + " ", true);
-              tts.flush();
-            }
-            */
-
-            try {
-              await handleLLMResponse(myTurn);
-            } finally {
-              isProcessing = false;
-            }
-          },
-          onError: (e) => fastify.log.error(e, 'STT error')
-        });
-        stt.connect();
-
-        // 2. Start TTS (Single persistent session)
-        tts = new ElevenLabsTTS({
-          apiKey: process.env.ELEVENLABS_API_KEY,
-          voiceId: process.env.ELEVENLABS_VOICE_ID,
-          onAudio: (b64, isFinal) => {
-            if (isGreeting) {
-              console.log(`[Greeting] audio byte`);
-            } else if (currentTurnStartTime && !firstAudioTimeLogged) {
-              firstAudioTimeLogged = true;
-              console.log(`[Net] TTS first byte: ${Date.now() - currentTurnStartTime}ms`);
-            }
-            isSpeaking = true;
-            twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
-            
-            // Send mark to Twilio when audio generation is finished
-            if (isFinal) {
-              currentMarkName = `tts-${Date.now()}`;
-              twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: currentMarkName } }));
-            }
+            return;
           }
-        });
 
-        await tts.connect(); // WAIT for open, no more 150ms guess
+          // Final committed transcript
+          if (isProcessing) return;
+          isProcessing = true;
+          speechStart = 0; // Reset speech tracker
+
+          const myTurn = ++turnId;
+          aborter?.abort();
+          aborter = new AbortController();
+          currentTurnStartTime = Date.now();
+          firstAudioTimeLogged = false;
+          
+          // Reset TTS interrupt/ignore audio state for the new turn
+          tts?.clearInterrupt();
+          
+          // Truncate conversation to keep history short and context clean (last 12 messages)
+          if (conversation.length > 12) {
+            conversation = [
+              conversation[0], // Keep system prompt
+              ...conversation.slice(-11)
+            ];
+          }
+          
+          conversation.push({ role: 'user', content: text });
+          console.log(`[STT] Final: "${text}"`);
+
+          try {
+            await handleLLMResponse(myTurn);
+          } catch (err) {
+            console.error('[LLM Error]', err);
+            if (myTurn === turnId) {
+              const fallbackText = "I'm sorry, I am experiencing a temporary connection issue. Could you please repeat that?";
+              tts?.clearInterrupt();
+              fallbackText.split(/(\s+)/).forEach(w => tts?.sendTextChunk(w, true));
+              tts?.flush();
+              conversation.push({ role: 'assistant', content: fallbackText });
+            }
+          } finally {
+            isProcessing = false;
+          }
+        };
+        stt.onError = (e) => fastify.log.error(e, 'STT error');
+
+        // Dynamically configure TTS callback
+        tts.onAudio = (b64, isFinal) => {
+          if (isGreeting) {
+            console.log(`[Greeting] audio byte`);
+          } else if (currentTurnStartTime && !firstAudioTimeLogged) {
+            firstAudioTimeLogged = true;
+            console.log(`[Net] TTS first byte: ${Date.now() - currentTurnStartTime}ms`);
+          }
+          isSpeaking = true;
+          twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
+          
+          // Send mark to Twilio when audio generation is finished
+          if (isFinal) {
+            currentMarkName = `tts-${Date.now()}`;
+            twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: currentMarkName } }));
+          }
+        };
+
+        // Wait for TTS connection if it was still in flight
+        if (pre?.ttsPromise) {
+          await pre.ttsPromise;
+        }
+
         const greet = `Hi, your order ${ORDER.id} is ${ORDER.status}, arriving ${ORDER.eta}. What would you like to know?`;
         conversation.push({ role: 'assistant', content: greet });
         
@@ -262,6 +281,7 @@ fastify.register(async (f) => {
       let firstTokenTime = null;
       let full = '';
       let buffer = '';
+      let isFirstChunk = true;
 
       for await (const token of streamLLM(conversation, aborter.signal)) {
         if (myTurn !== turnId) return; // aborted by barge-in
@@ -271,12 +291,24 @@ fastify.register(async (f) => {
         }
         
         buffer += token;
-        // Send to TTS only on word/space boundaries to avoid subword token latency in synthesis
-        if (/[\s\.\?\!]$/.test(buffer)) {
-          tts.sendTextChunk(buffer, true);
-          buffer = '';
-        }
         full += token;
+
+        // Dynamic buffering logic:
+        if (isFirstChunk) {
+          // Send first chunk quickly (3 words or 15 chars) to get audio started
+          const wordCount = buffer.trim().split(/\s+/).length;
+          if (wordCount >= 3 || buffer.length >= 15 || /[\.\?\!\;]$/.test(buffer)) {
+            tts.sendTextChunk(buffer, true);
+            buffer = '';
+            isFirstChunk = false;
+          }
+        } else {
+          // Subsequent chunks: buffer for natural phrase flow (punctuation or >= 40 chars)
+          if (/[\,\.\?\!\;]$/.test(buffer) || (buffer.length >= 40 && /[\s]$/.test(buffer))) {
+            tts.sendTextChunk(buffer, true);
+            buffer = '';
+          }
+        }
       }
       
       if (myTurn !== turnId) return;
