@@ -31,7 +31,7 @@ const ORDER = {
   eta: "July 12 by 7 PM"
 };
 
-const SYSTEM = `You are order assistant. Order=${JSON.stringify(ORDER)}. Be concise, 2 sentences max. No markdown. Speak numbers as words.`;
+const SYSTEM = `You are an order assistant. Order=${JSON.stringify(ORDER)}. Answer in under 15 words. Never use markdown. Speak numbers as words. Be extremely direct.`;
 
 const FILLERS = [
   "Let me check that.",
@@ -187,6 +187,20 @@ fastify.register(async (f) => {
           isProcessing = true;
           speechStart = 0; // Reset speech tracker
 
+          // Play cached voice filler immediately to mask generation latency
+          if (!isGreeting) {
+            const randomFiller = FILLERS[Math.floor(Math.random() * FILLERS.length)];
+            const cachedAudio = fillerCache[randomFiller];
+            if (cachedAudio) {
+              console.log(`[Filler] Playing cached: "${randomFiller}"`);
+              isSpeaking = true;
+              twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: cachedAudio } }));
+              // Send mark for the filler
+              currentMarkName = `filler-${Date.now()}`;
+              twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: currentMarkName } }));
+            }
+          }
+
           const myTurn = ++turnId;
           aborter?.abort();
           aborter = new AbortController();
@@ -295,9 +309,9 @@ fastify.register(async (f) => {
 
         // Dynamic buffering logic:
         if (isFirstChunk) {
-          // Send first chunk quickly (3 words or 15 chars) to get audio started
+          // Send first chunk quickly (1 word or 5 chars) to get audio started
           const wordCount = buffer.trim().split(/\s+/).length;
-          if (wordCount >= 3 || buffer.length >= 15 || /[\.\?\!\;]$/.test(buffer)) {
+          if (wordCount >= 1 || buffer.length >= 5 || /[\.\?\!\,\;]$/.test(buffer)) {
             tts.sendTextChunk(buffer, true);
             buffer = '';
             isFirstChunk = false;
