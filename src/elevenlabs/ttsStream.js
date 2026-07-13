@@ -16,7 +16,7 @@ export class ElevenLabsTTS {
     this.isClosedExplicitly = false;
     this.ignoringAudio = false;
     return new Promise((resolve) => {
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream-input?model_id=eleven_turbo_v2&output_format=ulaw_8000&optimize_streaming_latency=4&inactivity_timeout=180`;
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream-input?model_id=eleven_flash_v2_5&output_format=ulaw_8000&optimize_streaming_latency=4&inactivity_timeout=180`;
       this.ws = new WebSocket(url, { headers: { 'xi-api-key': this.apiKey } });
 
       this.ws.on('open', () => {
