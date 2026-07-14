@@ -10,7 +10,7 @@ export async function* streamLLM(messages, signal) {
     messages,
     stream: true,
     temperature: 0,
-    max_tokens: 200,
+    max_tokens: 100,
   });
   for await (const chunk of stream) {
     if (signal?.aborted) break;

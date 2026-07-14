@@ -119,11 +119,62 @@ fastify.register(async (f) => {
     let currentMarkName = null;
     let lastBotFinish = 0;
     let bargeInLockUntil = 0;
+    let lastFiller = null;
+
+    // Cost tracking variables
+    let totalLlmInputTokens = 0;
+    let totalLlmOutputTokens = 0;
+    let totalTtsChars = 0;
 
     const cleanup = () => {
       aborter?.abort();
       try { stt?.close(); } catch {}
       try { tts?.close(); } catch {}
+
+      if (startEventTime) {
+        const durationSec = (Date.now() - startEventTime) / 1000;
+        
+        // Twilio Outbound call ($0.014/min) + Media Stream ($0.004/min) = $0.018/min
+        const twilioVoiceCost = (durationSec / 60) * 0.014;
+        const twilioStreamCost = (durationSec / 60) * 0.004;
+        const twilioTotal = twilioVoiceCost + twilioStreamCost;
+        
+        // STT (ElevenLabs Scribe Realtime): $0.39 / hour
+        const sttTotal = (durationSec / 3600) * 0.39;
+        
+        // LLM (Groq Llama 3.1 8B): $0.05/M input, $0.08/M output
+        const llmInputCost = totalLlmInputTokens * (0.05 / 1000000);
+        const llmOutputCost = totalLlmOutputTokens * (0.08 / 1000000);
+        const llmTotal = llmInputCost + llmOutputCost;
+        
+        // TTS (ElevenLabs Flash v2.5): $0.015 / 1,000 characters
+        const ttsTotal = totalTtsChars * (0.015 / 1000);
+        
+        const grandTotal = twilioTotal + sttTotal + llmTotal + ttsTotal;
+        
+        console.log(`
+=============================================================
+                     CALL COST REPORT
+=============================================================
+Call Duration:       ${durationSec.toFixed(1)} seconds
+-------------------------------------------------------------
+Twilio Voice Cost:   $${twilioVoiceCost.toFixed(5)} ($0.0140/min)
+Twilio Stream Cost:  $${twilioStreamCost.toFixed(5)} ($0.0040/min)
+Twilio Total:        $${twilioTotal.toFixed(5)}
+-------------------------------------------------------------
+STT Cost (11Labs):   $${sttTotal.toFixed(5)} (Scribe $0.39/hr)
+-------------------------------------------------------------
+LLM Cost (Groq):     $${llmTotal.toFixed(5)}
+  - Input Tokens:    ${totalLlmInputTokens} ($0.05/M)
+  - Output Tokens:   ${totalLlmOutputTokens} ($0.08/M)
+-------------------------------------------------------------
+TTS Cost (11Labs):   $${ttsTotal.toFixed(5)}
+  - Total Characters: ${totalTtsChars} ($0.015/1K chars)
+-------------------------------------------------------------
+GRAND TOTAL:         $${grandTotal.toFixed(5)}
+=============================================================
+`);
+      }
     };
 
     twilioWs.on('message', async (raw) => {
@@ -189,10 +240,15 @@ fastify.register(async (f) => {
 
           // Play cached voice filler immediately to mask generation latency
           if (!isGreeting) {
-            const randomFiller = FILLERS[Math.floor(Math.random() * FILLERS.length)];
-            const cachedAudio = fillerCache[randomFiller];
+            let fillerText;
+            do {
+              fillerText = FILLERS[Math.floor(Math.random() * FILLERS.length)];
+            } while (fillerText === lastFiller && FILLERS.length > 1);
+            
+            lastFiller = fillerText;
+            const cachedAudio = fillerCache[fillerText];
             if (cachedAudio) {
-              console.log(`[Filler] Playing cached: "${randomFiller}"`);
+              console.log(`[Filler] Playing cached: "${fillerText}"`);
               isSpeaking = true;
               twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: cachedAudio } }));
               // Send mark for the filler
@@ -241,7 +297,10 @@ fastify.register(async (f) => {
         // Dynamically configure TTS callback
         tts.onAudio = (b64, isFinal) => {
           if (isGreeting) {
-            console.log(`[Greeting] audio byte`);
+            if (!firstAudioTimeLogged) {
+              firstAudioTimeLogged = true;
+              console.log(`[Net] Greeting TTS first byte: ${Date.now() - startEventTime}ms after start event`);
+            }
           } else if (currentTurnStartTime && !firstAudioTimeLogged) {
             firstAudioTimeLogged = true;
             console.log(`[Net] TTS first byte: ${Date.now() - currentTurnStartTime}ms`);
@@ -333,6 +392,13 @@ fastify.register(async (f) => {
       
       conversation.push({ role: 'assistant', content: full });
       console.log(`[LLM] Response: "${full}"`);
+
+      // Track token/character usage (standard heuristic: ~4 chars per token)
+      const inputTokens = Math.round(JSON.stringify(conversation).length / 4);
+      const outputTokens = Math.round(full.length / 4);
+      totalLlmInputTokens += inputTokens;
+      totalLlmOutputTokens += outputTokens;
+      totalTtsChars += full.length;
     }
 
     twilioWs.on('close', cleanup);
