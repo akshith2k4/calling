@@ -2,10 +2,10 @@
   "name": "calling",
   "version": "1.0.0",
   "type": "module",
-  "main": "src/server.js",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node src/server.js",
-    "call": "node src/makeCall.js"
+    "start": "node src/index.js",
+    "call": "node src/index.js --call"
   },
   "dependencies": {
     "@fastify/websocket": "^8.3.1",
