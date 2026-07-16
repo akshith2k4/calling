@@ -17,15 +17,27 @@ export class TwilioTelephony extends TelephonyProvider {
   }
 
   async createCall({ to, context, machineDetection = true }) {
+    if (!to || typeof to !== 'string' || !/^\+?[1-9]\d{1,14}$/.test(to.trim())) {
+      throw new Error(`Invalid "to" phone number format: ${to}`);
+    }
+    let sanitizedContext = null;
+    if (context && typeof context === 'object') {
+      try {
+        sanitizedContext = JSON.parse(JSON.stringify(context));
+      } catch (err) {
+        throw new Error(`Invalid context payload: ${err.message}`);
+      }
+    }
+
     const call = await this.client.calls.create({
-      to,
+      to: to.trim(),
       from: this.fromNumber,
       url: `https://${this.domain}/voice`,
       machineDetection: machineDetection ? 'Enable' : undefined,
       asyncAmd: machineDetection ? 'true' : undefined,
     });
-    if (context) {
-      this.callContexts.set(call.sid, context);
+    if (sanitizedContext) {
+      this.callContexts.set(call.sid, sanitizedContext);
     }
     return call;
   }
@@ -108,7 +120,7 @@ export class TwilioTelephony extends TelephonyProvider {
           pipeline.start({ callSid, streamSid });
         }
 
-        if (data.event === 'media' && pipeline) {
+        if (data.event === 'media' && pipeline && pipeline.isStarted) {
           if (!firstMediaLogged && pipeline.startTime) {
             firstMediaLogged = true;
             console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);

@@ -7,6 +7,10 @@ export class ElevenLabsSTT extends STTProvider {
                 vadSilenceThresholdSecs, vadThreshold, minVolumeThreshold,
                 onTranscript, onError }) {
     super({ onTranscript, onError });
+    if (!apiKey) throw new Error('ElevenLabsSTT: apiKey is required');
+    if (!model) throw new Error('ElevenLabsSTT: model is required');
+    if (!audioFormat) throw new Error('ElevenLabsSTT: audioFormat is required');
+
     this.apiKey = apiKey;
     this.params = { model_id: model, language_code: language, audio_format: audioFormat,
                     commit_strategy: commitStrategy, vad_silence_threshold_secs: vadSilenceThresholdSecs,

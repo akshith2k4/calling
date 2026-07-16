@@ -34,6 +34,7 @@ export class BargeInController {
   onBotFinished() {
     if (this.isGreeting) this.isGreeting = false;
     this.lastBotFinish = Date.now();
+    this.speechStart = 0;
   }
 
   /**
@@ -47,9 +48,13 @@ export class BargeInController {
     if (Date.now() < this.lockUntil) return false;
     if (Date.now() - this.lastBotFinish < this.postBotLockMs) return false;
 
-    if (this.speechStart === 0) this.speechStart = Date.now();
+    const now = Date.now();
+    if (this.speechStart === 0 || (this.lastPartialTime && now - this.lastPartialTime > 1000)) {
+      this.speechStart = now;
+    }
+    this.lastPartialTime = now;
 
-    if (text.length > this.minLength && Date.now() - this.speechStart > this.speechStartMs) {
+    if (text.length > this.minLength && now - this.speechStart > this.speechStartMs) {
       const lower = text.toLowerCase().trim();
       if (this.backchannels.includes(lower)) return false;
       if (text.trim().split(/\s+/).length < this.minWords) return false;
@@ -65,5 +70,6 @@ export class BargeInController {
 
   resetSpeechStart() {
     this.speechStart = 0;
+    this.lastPartialTime = 0;
   }
 }

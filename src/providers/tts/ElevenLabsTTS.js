@@ -24,9 +24,19 @@ export class ElevenLabsTTS extends TTSProvider {
     this.ignoringAudio = false;
     return new Promise((resolve) => {
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream-input?model_id=${this.model}&output_format=${this.outputFormat}&optimize_streaming_latency=${this.optimizeStreamingLatency}&inactivity_timeout=${this.inactivityTimeout}`;
-      this.ws = new WebSocket(url, { headers: { 'xi-api-key': this.apiKey } });
+      
+      try {
+        this.ws = new WebSocket(url, { headers: { 'xi-api-key': this.apiKey } });
+      } catch (err) {
+        console.error('[TTS] WebSocket instantiation error:', err);
+        resolve();
+        return;
+      }
+
+      let opened = false;
 
       this.ws.on('open', () => {
+        opened = true;
         this.ws.send(JSON.stringify({
           text: ' ',
           voice_settings: { stability: 0.45, similarity_boost: 0.8 },
@@ -50,10 +60,16 @@ export class ElevenLabsTTS extends TTSProvider {
 
       this.ws.on('close', (c) => {
         console.log(`[TTS] Closed: ${c}`);
+        if (!opened) resolve();
         if (!this.isClosedExplicitly && (c === 1006 || c === 1005)) {
           console.log('[TTS] Reconnecting in 1s...');
           setTimeout(() => this.connect(), 1000);
         }
+      });
+
+      this.ws.on('error', (err) => {
+        console.error('[TTS] WebSocket error:', err);
+        if (!opened) resolve();
       });
     });
   }

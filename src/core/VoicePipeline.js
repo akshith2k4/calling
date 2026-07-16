@@ -36,6 +36,7 @@ export class VoicePipeline {
     this.firstAudioLogged = false;
     this.lastFiller = null;
     this.prewarmPromise = null;
+    this.isStarted = false;
   }
 
   // ─── Lifecycle ───────────────────────────────────────────
@@ -65,6 +66,7 @@ export class VoicePipeline {
     this.callSid = callSid;
     this.streamSid = streamSid;
     this.startTime = Date.now();
+    this.isStarted = true;
     this._playGreeting();
   }
 
@@ -73,7 +75,13 @@ export class VoicePipeline {
   }
 
   stop() {
-    this.aborter?.abort();
+    try {
+      this.aborter?.abort();
+    } catch (err) {
+      console.error('[Pipeline] Error aborting during stop:', err);
+    } finally {
+      this.aborter = null;
+    }
     try { this.stt?.close(); } catch {}
     try { this.tts?.close(); } catch {}
     this.cost.report(this.startTime);

@@ -28,8 +28,9 @@ export const linenGrassReminderAgent = {
     `4. Get their confirmation on the timing (e.g. they say "by evening" or "in one hour"), acknowledge it, and tell them to make sure they place the order in the LinenGrass application only.\n` +
     `5. Only if they ask about past orders, use this info: Last order was on ${ctx.lastOrder?.date}, ID: ${ctx.lastOrder?.id}, for ${ctx.lastOrder?.products}.\n\n` +
     `CRITICAL RULES:\n` +
-    `- Listen carefully for the language. The customer's input might be transcribed phonetically (e.g. Hinglish or Kannadish) or in a different script. Detect if they are speaking Hindi or Kannada, and respond in the matching language.\n` +
-    `- You MUST write Hindi responses in native Devanagari script (हिंदी) and Kannada responses in native Kannada script (ಕನ್ನಡ). Do NOT write Hindi/Kannada using English characters (Hinglish/Kannadish), as the text-to-speech engine needs native script to speak with a natural Indian accent.\n` +
+    `- DEFAULT LANGUAGE IS ENGLISH. You must reply in English unless the user speaks to you strictly in Hindi or Kannada.\n` +
+    `- If the user speaks Hindi, reply in native Devanagari script (हिंदी). If they speak Kannada, reply in native Kannada script (ಕನ್ನಡ).\n` +
+    `- DO NOT translate English words to Hindi. If the user speaks English, even with an Indian accent, reply in English.\n` +
     `- Ask ONE question at a time. Wait for the user to reply.\n` +
     `- Answer in under 15 words. Never use markdown.\n` +
     `- Speak numbers as words (e.g., say "two" instead of "2").\n` +
@@ -53,7 +54,7 @@ export const linenGrassReminderAgent = {
     stt: {
       name: 'elevenlabs',
       model: 'scribe_v2_realtime',
-      language: 'en', // Default baseline (can be overridden dynamically by context)
+      language: null, // Enable auto-detection of language (English/Hindi/Kannada)
       audioFormat: 'ulaw_8000',
       vadSilenceThresholdSecs: 1.25,
       vadThreshold: 0.90,
