@@ -147,6 +147,8 @@ export class VoicePipeline {
 
   // ─── Turn Processing ─────────────────────────────────────
 
+  async _processTurn(userText) {
+    this.fillerPlayedThisTurn = false;
     this.lastFillerPlayTime = 0;
     // Play cached filler to mask LLM latency (skip during greeting)
     if (!this.bargeIn.isGreeting) {
@@ -159,10 +161,11 @@ export class VoicePipeline {
         this.transport.sendMedia(cached);
         this.currentMark = `filler-${Date.now()}`;
         this.transport.sendMark(this.currentMark);
+        this.fillerPlayedThisTurn = true;
 
-        // Estimate filler duration (approx 2.5 words per second)
-        const wordCount = fillerText.trim().split(/\s+/).length;
-        this.lastFillerPlayTime = Math.round((wordCount / 2.5) * 1000);
+        // Calculate actual filler duration in ms: (bufferLength / 8000) * 1000
+        const bufferLength = Buffer.from(cached, 'base64').length;
+        this.lastFillerPlayTime = Math.round(bufferLength / 8);
       }
     }
 
@@ -255,17 +258,29 @@ export class VoicePipeline {
     } else if (this.trueLatencyStart && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
       const latencyMs = Date.now() - this.trueLatencyStart;
-      const fillerMs = this.lastFillerPlayTime || 0;
-      const perceivedMs = latencyMs + fillerMs;
+      
+      if (this.fillerPlayedThisTurn) {
+        const fillerMs = this.lastFillerPlayTime || 0;
+        const perceivedMs = latencyMs + fillerMs;
 
-      if (this.callSid) {
-        logEvent(this.callSid, 'true_voice_latency', { 
-          ms: latencyMs,
-          fillerMs,
-          perceivedMs
-        });
+        if (this.callSid) {
+          logEvent(this.callSid, 'true_voice_latency', { 
+            ms: latencyMs,
+            fillerMs,
+            perceivedMs,
+            fillerPlayed: true
+          });
+        }
+        console.log(`[Latency] True Voice Latency: ${latencyMs}ms (filler: ${fillerMs}ms, perceived: ${perceivedMs}ms)`);
+      } else {
+        if (this.callSid) {
+          logEvent(this.callSid, 'true_voice_latency', { 
+            ms: latencyMs,
+            fillerPlayed: false
+          });
+        }
+        console.log(`[Latency] True Voice Latency (no filler): ${latencyMs}ms`);
       }
-      console.log(`[Latency] True Voice Latency: ${latencyMs}ms (filler: ${fillerMs}ms, perceived: ${perceivedMs}ms)`);
       
       const latency = Date.now() - this.currentTurnStart;
       if (this.callSid) {

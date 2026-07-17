@@ -555,7 +555,7 @@ export default function Dashboard() {
                       } else if (evt.event_type === 'true_voice_latency') {
                         badgeColor = 'bg-rose-500/10 text-rose-400 border border-rose-500/20';
                         desc = `True Voice Latency: ${evt.payload?.ms || 0}ms` +
-                               (evt.payload?.fillerMs ? ` + Filler: ${evt.payload.fillerMs}ms (Perceived Silence-to-Speech: ${evt.payload.perceivedMs}ms)` : '');
+                               (evt.payload?.fillerPlayed && evt.payload?.fillerMs ? ` + Filler: ${evt.payload.fillerMs}ms (Perceived Silence-to-Speech: ${evt.payload.perceivedMs}ms)` : '');
                       } else {
                         desc = evt.event_type;
                       }

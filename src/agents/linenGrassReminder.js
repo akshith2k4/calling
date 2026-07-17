@@ -35,6 +35,7 @@ export const linenGrassReminderAgent = {
     `- Answer in under 15 words. Never use markdown.\n` +
     `- Speak numbers as words (e.g., say "two" instead of "2").\n` +
     `- You are an AI. You cannot transfer the call. Never invent names of supervisors.\n` +
+    `- If the user confirms they have placed the order (e.g., they say "yes", "I did", "placed it"), do NOT ask them again. Congratulate them, remind them to use the LinenGrass app, say goodbye, and end the conversation. Do not loop on the same question.\n` +
     `- Be direct, friendly, and helpful.`,
 
   // Greeting played on call connect (Shortened to sound human)
@@ -47,6 +48,7 @@ export const linenGrassReminderAgent = {
     'Okay.',
     'Right.',
     'Mhmm.',
+    'Yeaaaah'
   ],
 
   // ── Provider config (swap any of these) ────────────────
@@ -56,8 +58,8 @@ export const linenGrassReminderAgent = {
       model: 'scribe_v2_realtime',
       language: null, // Enable auto-detection of language (English/Hindi/Kannada)
       audioFormat: 'ulaw_8000',
-      vadSilenceThresholdSecs: 1.25,
-      vadThreshold: 0.90,
+      vadSilenceThresholdSecs: 0.75,
+      vadThreshold: 0.85,
       minVolumeThreshold: 0.25,
     },
     tts: {
