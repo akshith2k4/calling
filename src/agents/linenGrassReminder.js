@@ -43,10 +43,10 @@ export const linenGrassReminderAgent = {
 
   // Cached filler phrases to mask LLM latency
   fillers: [
-    'Let me check that.',
-    'One second.',
-    'Okay, let me see.',
-    'Sure, let me check your last order details.',
+    'Hmm.',
+    'Okay.',
+    'Right.',
+    'Mhmm.',
   ],
 
   // ── Provider config (swap any of these) ────────────────
@@ -70,7 +70,7 @@ export const linenGrassReminderAgent = {
       name: 'openai-compat',
       apiKey: process.env.GROQ_API_KEY,
       baseURL: 'https://api.groq.com/openai/v1',
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       temperature: 0,
       maxTokens: 500,
     },

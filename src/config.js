@@ -11,4 +11,9 @@ export const config = {
   ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID,
   GROQ_API_KEY: process.env.GROQ_API_KEY,
+  DATABASE_URL: process.env.DATABASE_URL,
+  AWS_REGION: process.env.AWS_REGION || 'us-east-1',
+  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+  AWS_S3_BUCKET: process.env.AWS_S3_BUCKET,
 };

@@ -3,6 +3,7 @@
 import { ConversationManager } from './ConversationManager.js';
 import { BargeInController } from './BargeInController.js';
 import { CostTracker } from './CostTracker.js';
+import { logEvent } from '../services/ObservabilityService.js';
 
 export class VoicePipeline {
   constructor({ stt, tts, llm, agent, cost: costTracker, fillers }) {
@@ -54,6 +55,9 @@ export class VoicePipeline {
     this.tts.onAudio = (b64, isFinal) => this._onTTSAudio(b64, isFinal);
 
     this.stt.connect();          // fire-and-forget (auto-reconnects internally)
+    if (this.callSid) {
+      logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
+    }
     await this.tts.connect();    // must be open before sending text
   }
 
@@ -67,6 +71,7 @@ export class VoicePipeline {
     this.streamSid = streamSid;
     this.startTime = Date.now();
     this.isStarted = true;
+    logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
     this._playGreeting();
   }
 
@@ -116,11 +121,22 @@ export class VoicePipeline {
     this.isProcessing = true;
     this.bargeIn.resetSpeechStart();
 
+    if (this.callSid) {
+      const vadThresholdSecs = this.agent.providers?.stt?.vadSilenceThresholdSecs || 1.25;
+      logEvent(this.callSid, 'stt_final', { 
+        text,
+        estimatedVadMs: Math.round(vadThresholdSecs * 1000)
+      });
+    }
+
     this._processTurn(text).finally(() => { this.isProcessing = false; });
   }
 
   _handleBargeIn(text) {
     console.log(`[Barge-in] "${text}"`);
+    if (this.callSid) {
+      logEvent(this.callSid, 'barge_in', { text });
+    }
     this.bargeIn.recordBargeIn();
     this.turnId++;
     this.aborter?.abort();
@@ -131,7 +147,7 @@ export class VoicePipeline {
 
   // ─── Turn Processing ─────────────────────────────────────
 
-  async _processTurn(userText) {
+    this.lastFillerPlayTime = 0;
     // Play cached filler to mask LLM latency (skip during greeting)
     if (!this.bargeIn.isGreeting) {
       const fillerText = this.fillers.getRandom(this.lastFiller);
@@ -143,6 +159,10 @@ export class VoicePipeline {
         this.transport.sendMedia(cached);
         this.currentMark = `filler-${Date.now()}`;
         this.transport.sendMark(this.currentMark);
+
+        // Estimate filler duration (approx 2.5 words per second)
+        const wordCount = fillerText.trim().split(/\s+/).length;
+        this.lastFillerPlayTime = Math.round((wordCount / 2.5) * 1000);
       }
     }
 
@@ -153,10 +173,12 @@ export class VoicePipeline {
     this.firstAudioLogged = false;
     this.tts.clearInterrupt();
 
+    this.trueLatencyStart = null;
     this.conversation.truncate();
     this.conversation.pushUser(userText);
     console.log(`[STT] Final: "${userText}"`);
 
+    this.trueLatencyStart = Date.now();
     try {
       await this._streamLLM(myTurn);
     } catch (err) {
@@ -182,7 +204,11 @@ export class VoicePipeline {
 
       if (!firstTokenTime && this.currentTurnStart) {
         firstTokenTime = Date.now();
-        console.log(`[Latency] TTFT: ${firstTokenTime - this.currentTurnStart}ms`);
+        const latency = firstTokenTime - this.currentTurnStart;
+        console.log(`[Latency] TTFT: ${latency}ms`);
+        if (this.callSid) {
+          logEvent(this.callSid, 'ttft', { latency });
+        }
       }
 
       buffer += token;
@@ -211,6 +237,9 @@ export class VoicePipeline {
     this.conversation.pushAssistant(full);
     this.cost.trackLLM(this.conversation.toJSON(), full);
     console.log(`[LLM] Response: "${full}"`);
+    if (this.callSid) {
+      logEvent(this.callSid, 'llm_response', { text: full });
+    }
   }
 
   // ─── TTS Callbacks ───────────────────────────────────────
@@ -218,10 +247,37 @@ export class VoicePipeline {
   _onTTSAudio(b64, isFinal) {
     if (this.bargeIn.isGreeting && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
-      console.log(`[Net] Greeting TTS first byte: ${Date.now() - this.startTime}ms after start`);
+      const latency = Date.now() - this.startTime;
+      console.log(`[Net] Greeting TTS first byte: ${latency}ms after start`);
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'greeting' });
+      }
+    } else if (this.trueLatencyStart && !this.firstAudioLogged) {
+      this.firstAudioLogged = true;
+      const latencyMs = Date.now() - this.trueLatencyStart;
+      const fillerMs = this.lastFillerPlayTime || 0;
+      const perceivedMs = latencyMs + fillerMs;
+
+      if (this.callSid) {
+        logEvent(this.callSid, 'true_voice_latency', { 
+          ms: latencyMs,
+          fillerMs,
+          perceivedMs
+        });
+      }
+      console.log(`[Latency] True Voice Latency: ${latencyMs}ms (filler: ${fillerMs}ms, perceived: ${perceivedMs}ms)`);
+      
+      const latency = Date.now() - this.currentTurnStart;
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
+      }
     } else if (this.currentTurnStart && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
-      console.log(`[Net] TTS first byte: ${Date.now() - this.currentTurnStart}ms`);
+      const latency = Date.now() - this.currentTurnStart;
+      console.log(`[Net] TTS first byte: ${latency}ms`);
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
+      }
     }
 
     this.isSpeaking = true;

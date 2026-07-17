@@ -23,7 +23,7 @@ export class CostTracker {
   }
 
   report(startTime) {
-    if (!startTime) return;
+    if (!startTime) return { total: 0 };
     const dur = (Date.now() - startTime) / 1000;
     const twilioVoice = (dur / 60) * this.rates.twilioVoicePerMin;
     const twilioStream = (dur / 60) * this.rates.twilioStreamPerMin;
@@ -32,6 +32,21 @@ export class CostTracker {
     const llmOut = this.llmOutputTokens * (this.rates.llmOutputPerM / 1e6);
     const tts = this.ttsChars * (this.rates.ttsPer1kChars / 1000);
     const total = twilioVoice + twilioStream + stt + llmIn + llmOut + tts;
+
+    this.totalCost = total;
+    this.breakdown = {
+      twilioVoice,
+      twilioStream,
+      stt,
+      llmIn,
+      llmOut,
+      tts,
+      total,
+      duration: dur,
+      llmInputTokens: this.llmInputTokens,
+      llmOutputTokens: this.llmOutputTokens,
+      ttsChars: this.ttsChars
+    };
 
     console.log(`
 =============================================================
@@ -47,5 +62,6 @@ TTS:                 ${this.ttsChars} chars   $${tts.toFixed(5)}
 -------------------------------------------------------------
 GRAND TOTAL:         $${total.toFixed(5)}
 =============================================================`);
+    return this.breakdown;
   }
 }

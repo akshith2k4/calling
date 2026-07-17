@@ -1,10 +1,12 @@
 // src/server/createServer.js
 import Fastify from 'fastify';
 import fastifyWs from '@fastify/websocket';
+import { attachObservabilityWebSocket } from '../services/ObservabilityService.js';
 
 export async function createServer({ telephony, port = 3000 }) {
   const app = Fastify({ logger: true });
   await app.register(fastifyWs);
+  attachObservabilityWebSocket(app);
 
   // URL-encoded body parser for Twilio webhooks
   app.addContentTypeParser('application/x-www-form-urlencoded', (req, payload, done) => {
