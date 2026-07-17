@@ -79,7 +79,8 @@ export default function Dashboard() {
   // Connect WebSocket for live events
   useEffect(() => {
     setWsStatus('connecting');
-    const ws = new WebSocket('ws://localhost:3000/ws/observability');
+    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000/ws/observability';
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       setWsStatus('connected');
