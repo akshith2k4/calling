@@ -18,6 +18,12 @@ CEREBRAS_API_KEY=cbs-xxx
 GROQ_API_KEY=gsk-xxx
 PORT=3000
 
+DATABASE_URL=postgres://user:pass@ep-xxx.neon.tech/dbname?sslmode=require
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=xxx
+AWS_SECRET_ACCESS_KEY=xxx
+AWS_S3_BUCKET=linengrass-recordings
+
 ```
 
 ---
@@ -32,15 +38,19 @@ PORT=3000
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "call": "node src/index.js --call"
+    "call": "node src/index.js --call",
+    "tunnel": "npx ngrok http 3000 --url spied-unlovable-playable.ngrok-free.dev"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1089.0",
+    "@aws-sdk/s3-request-presigner": "^3.1089.0",
     "@fastify/websocket": "^8.3.1",
+    "dotenv": "^16.4.5",
     "fastify": "^4.28.1",
     "openai": "^4.56.0",
-    "ws": "^8.18.0",
-    "dotenv": "^16.4.5",
-    "twilio": "^5.2.0"
+    "pg": "^8.22.0",
+    "twilio": "^5.2.0",
+    "ws": "^8.18.0"
   }
 }
 
@@ -101,6 +111,11 @@ export const config = {
   ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID,
   GROQ_API_KEY: process.env.GROQ_API_KEY,
+  DATABASE_URL: process.env.DATABASE_URL,
+  AWS_REGION: process.env.AWS_REGION || 'us-east-1',
+  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+  AWS_S3_BUCKET: process.env.AWS_S3_BUCKET,
 };
 
 ```
@@ -130,6 +145,7 @@ async function main() {
       model: agent.providers.tts.model,
       outputFormat: agent.providers.tts.outputFormat,
       text,
+      speed: agent.providers.tts.speed || 1.0,
     }),
   });
   await fillers.prewarm();
@@ -315,7 +331,7 @@ export class CostTracker {
   }
 
   report(startTime) {
-    if (!startTime) return;
+    if (!startTime) return { total: 0 };
     const dur = (Date.now() - startTime) / 1000;
     const twilioVoice = (dur / 60) * this.rates.twilioVoicePerMin;
     const twilioStream = (dur / 60) * this.rates.twilioStreamPerMin;
@@ -324,6 +340,21 @@ export class CostTracker {
     const llmOut = this.llmOutputTokens * (this.rates.llmOutputPerM / 1e6);
     const tts = this.ttsChars * (this.rates.ttsPer1kChars / 1000);
     const total = twilioVoice + twilioStream + stt + llmIn + llmOut + tts;
+
+    this.totalCost = total;
+    this.breakdown = {
+      twilioVoice,
+      twilioStream,
+      stt,
+      llmIn,
+      llmOut,
+      tts,
+      total,
+      duration: dur,
+      llmInputTokens: this.llmInputTokens,
+      llmOutputTokens: this.llmOutputTokens,
+      ttsChars: this.ttsChars
+    };
 
     console.log(`
 =============================================================
@@ -339,6 +370,7 @@ TTS:                 ${this.ttsChars} chars   $${tts.toFixed(5)}
 -------------------------------------------------------------
 GRAND TOTAL:         $${total.toFixed(5)}
 =============================================================`);
+    return this.breakdown;
   }
 }
 
@@ -382,6 +414,16 @@ export class FillerManager {
 
   get(text) {
     return this.cache[text];
+  }
+
+  async prewarmText(text) {
+    if (!this.prefetchFn) return;
+    try {
+      this.cache[text] = await this.prefetchFn(text);
+      console.log(`[Filler Cache] Custom Pre-warmed: "${text}" (${this.cache[text].length} bytes)`);
+    } catch (err) {
+      console.error(`[Filler Cache] Failed to cache custom text "${text}":`, err.message);
+    }
   }
 }
 
@@ -449,6 +491,7 @@ export function createPipelineFactory(agent, env, fillers) {
 import { ConversationManager } from './ConversationManager.js';
 import { BargeInController } from './BargeInController.js';
 import { CostTracker } from './CostTracker.js';
+import { logEvent } from '../services/ObservabilityService.js';
 
 export class VoicePipeline {
   constructor({ stt, tts, llm, agent, cost: costTracker, fillers }) {
@@ -500,6 +543,9 @@ export class VoicePipeline {
     this.tts.onAudio = (b64, isFinal) => this._onTTSAudio(b64, isFinal);
 
     this.stt.connect();          // fire-and-forget (auto-reconnects internally)
+    if (this.callSid) {
+      logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
+    }
     await this.tts.connect();    // must be open before sending text
   }
 
@@ -513,6 +559,7 @@ export class VoicePipeline {
     this.streamSid = streamSid;
     this.startTime = Date.now();
     this.isStarted = true;
+    logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
     this._playGreeting();
   }
 
@@ -562,11 +609,22 @@ export class VoicePipeline {
     this.isProcessing = true;
     this.bargeIn.resetSpeechStart();
 
+    if (this.callSid) {
+      const vadThresholdSecs = this.agent.providers?.stt?.vadSilenceThresholdSecs || 1.25;
+      logEvent(this.callSid, 'stt_final', { 
+        text,
+        estimatedVadMs: Math.round(vadThresholdSecs * 1000)
+      });
+    }
+
     this._processTurn(text).finally(() => { this.isProcessing = false; });
   }
 
   _handleBargeIn(text) {
     console.log(`[Barge-in] "${text}"`);
+    if (this.callSid) {
+      logEvent(this.callSid, 'barge_in', { text });
+    }
     this.bargeIn.recordBargeIn();
     this.turnId++;
     this.aborter?.abort();
@@ -578,6 +636,8 @@ export class VoicePipeline {
   // ─── Turn Processing ─────────────────────────────────────
 
   async _processTurn(userText) {
+    this.fillerPlayedThisTurn = false;
+    this.lastFillerPlayTime = 0;
     // Play cached filler to mask LLM latency (skip during greeting)
     if (!this.bargeIn.isGreeting) {
       const fillerText = this.fillers.getRandom(this.lastFiller);
@@ -589,6 +649,11 @@ export class VoicePipeline {
         this.transport.sendMedia(cached);
         this.currentMark = `filler-${Date.now()}`;
         this.transport.sendMark(this.currentMark);
+        this.fillerPlayedThisTurn = true;
+
+        // Calculate actual filler duration in ms: (bufferLength / 8000) * 1000
+        const bufferLength = Buffer.from(cached, 'base64').length;
+        this.lastFillerPlayTime = Math.round(bufferLength / 8);
       }
     }
 
@@ -599,10 +664,12 @@ export class VoicePipeline {
     this.firstAudioLogged = false;
     this.tts.clearInterrupt();
 
+    this.trueLatencyStart = null;
     this.conversation.truncate();
     this.conversation.pushUser(userText);
     console.log(`[STT] Final: "${userText}"`);
 
+    this.trueLatencyStart = Date.now();
     try {
       await this._streamLLM(myTurn);
     } catch (err) {
@@ -628,7 +695,11 @@ export class VoicePipeline {
 
       if (!firstTokenTime && this.currentTurnStart) {
         firstTokenTime = Date.now();
-        console.log(`[Latency] TTFT: ${firstTokenTime - this.currentTurnStart}ms`);
+        const latency = firstTokenTime - this.currentTurnStart;
+        console.log(`[Latency] TTFT: ${latency}ms`);
+        if (this.callSid) {
+          logEvent(this.callSid, 'ttft', { latency });
+        }
       }
 
       buffer += token;
@@ -657,6 +728,9 @@ export class VoicePipeline {
     this.conversation.pushAssistant(full);
     this.cost.trackLLM(this.conversation.toJSON(), full);
     console.log(`[LLM] Response: "${full}"`);
+    if (this.callSid) {
+      logEvent(this.callSid, 'llm_response', { text: full });
+    }
   }
 
   // ─── TTS Callbacks ───────────────────────────────────────
@@ -664,10 +738,53 @@ export class VoicePipeline {
   _onTTSAudio(b64, isFinal) {
     if (this.bargeIn.isGreeting && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
-      console.log(`[Net] Greeting TTS first byte: ${Date.now() - this.startTime}ms after start`);
+      const latency = Date.now() - this.startTime;
+      console.log(`[Net] Greeting TTS first byte: ${latency}ms after start`);
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'greeting' });
+      }
+    } else if (this.trueLatencyStart && !this.firstAudioLogged) {
+      this.firstAudioLogged = true;
+      const latencyMs = Date.now() - this.trueLatencyStart;
+      
+      if (this.fillerPlayedThisTurn) {
+        const fillerMs = this.lastFillerPlayTime || 0;
+        const perceivedMs = latencyMs + fillerMs;
+
+        if (this.callSid) {
+          logEvent(this.callSid, 'true_voice_latency', { 
+            ms: latencyMs,
+            fillerMs,
+            perceivedMs,
+            fillerPlayed: true
+          });
+        }
+        console.log(`[Latency] True Voice Latency: ${latencyMs}ms (filler: ${fillerMs}ms, perceived: ${perceivedMs}ms)`);
+        
+        // Interrupt/clear the Twilio playback queue to cut off the filler instantly
+        console.log('[Filler] Cutting off filler playback to play actual response');
+        this.transport.sendClear();
+      } else {
+        if (this.callSid) {
+          logEvent(this.callSid, 'true_voice_latency', { 
+            ms: latencyMs,
+            fillerPlayed: false
+          });
+        }
+        console.log(`[Latency] True Voice Latency (no filler): ${latencyMs}ms`);
+      }
+      
+      const latency = Date.now() - this.currentTurnStart;
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
+      }
     } else if (this.currentTurnStart && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
-      console.log(`[Net] TTS first byte: ${Date.now() - this.currentTurnStart}ms`);
+      const latency = Date.now() - this.currentTurnStart;
+      console.log(`[Net] TTS first byte: ${latency}ms`);
+      if (this.callSid) {
+        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
+      }
     }
 
     this.isSpeaking = true;
@@ -780,11 +897,13 @@ export class OpenAICompatLLM extends LLMProvider {
 
 ```javascript
 // src/providers/telephony/TwilioTelephony.js
-import fs from 'fs';
-import path from 'path';
 import twilio from 'twilio';
 import { TelephonyProvider } from '../../core/interfaces.js';
 import { TwilioTransport } from './TwilioTransport.js';
+import { startCall, endCall, logEvent } from '../../services/ObservabilityService.js';
+import { createWavBuffer } from '../../utils/wav.js';
+import { uploadWavFile } from '../../services/S3Service.js';
+import { extractCallOutcome } from '../../services/IntentService.js';
 
 export class TwilioTelephony extends TelephonyProvider {
   constructor({ accountSid, authToken, fromNumber, domain, pipelineFactory }) {
@@ -801,7 +920,7 @@ export class TwilioTelephony extends TelephonyProvider {
     if (!to || typeof to !== 'string' || !/^\+?[1-9]\d{1,14}$/.test(to.trim())) {
       throw new Error(`Invalid "to" phone number format: ${to}`);
     }
-    let sanitizedContext = null;
+    let sanitizedContext = {};
     if (context && typeof context === 'object') {
       try {
         sanitizedContext = JSON.parse(JSON.stringify(context));
@@ -809,6 +928,7 @@ export class TwilioTelephony extends TelephonyProvider {
         throw new Error(`Invalid context payload: ${err.message}`);
       }
     }
+    sanitizedContext.toNumber = to.trim();
 
     const call = await this.client.calls.create({
       to: to.trim(),
@@ -817,9 +937,8 @@ export class TwilioTelephony extends TelephonyProvider {
       machineDetection: machineDetection ? 'Enable' : undefined,
       asyncAmd: machineDetection ? 'true' : undefined,
     });
-    if (sanitizedContext) {
-      this.callContexts.set(call.sid, sanitizedContext);
-    }
+    
+    this.callContexts.set(call.sid, sanitizedContext);
     return call;
   }
 
@@ -836,7 +955,9 @@ export class TwilioTelephony extends TelephonyProvider {
       const callSid = req.body?.CallSid || req.query?.CallSid;
       if (callSid) {
         console.log(`[Pre-warm] Creating pipeline for CallSid: ${callSid}`);
-        const context = this.callContexts.get(callSid);
+        const context = this.callContexts.get(callSid) || {};
+        context.toNumber = req.body?.To || req.query?.To || context.toNumber || 'unknown';
+        this.callContexts.set(callSid, context);
         const pipeline = this.pipelineFactory(context);
         const prewarmPromise = pipeline.prewarm();
         this.prewarmed.set(callSid, { pipeline, prewarmPromise });
@@ -856,45 +977,99 @@ export class TwilioTelephony extends TelephonyProvider {
       let transport = null;
       let pipeline = null;
       let firstMediaLogged = false;
-      let customerStream = null;
-      let botStream = null;
 
-      const recordingsDir = path.join(process.cwd(), 'recordings');
-      if (!fs.existsSync(recordingsDir)) {
-        fs.mkdirSync(recordingsDir, { recursive: true });
-      }
+      let customerAudioBuffer = Buffer.alloc(0);
+      let botAudioBuffer = Buffer.alloc(0);
+      let callSid = null;
+      let toNumber = 'unknown';
+      let callEnded = false;
+
+      const finishCall = async () => {
+        if (callEnded) return;
+        callEnded = true;
+
+        if (pipeline) {
+          pipeline.stop();
+          const durationSecs = Math.round((Date.now() - pipeline.startTime) / 1000);
+          const finalCost = pipeline.cost ? (pipeline.cost.totalCost || 0) : 0;
+          const costBreakdown = pipeline.cost ? (pipeline.cost.breakdown || {}) : {};
+          const transcript = pipeline.conversation ? pipeline.conversation.getMessages() : [];
+          
+          // Process S3 uploads and DB inserts asynchronously (background task)
+          (async () => {
+            try {
+              const customerWav = createWavBuffer(customerAudioBuffer);
+              const botWav = createWavBuffer(botAudioBuffer);
+
+              const [customerUrl, botUrl] = await Promise.all([
+                uploadWavFile(callSid, 'customer', customerWav),
+                uploadWavFile(callSid, 'bot', botWav)
+              ]);
+
+              const recordingUrls = { customer: customerUrl, bot: botUrl };
+              
+              // Extract call outcome/status using IntentService
+              const outcome = await extractCallOutcome(transcript);
+              if (callSid) {
+                await logEvent(callSid, 'call_outcome', outcome);
+              }
+              console.log(`[Intent] Call ${callSid} outcome:`, outcome);
+
+              // ── SEND TO YOUR EXTERNAL API ──
+              if (outcome.status !== 'unknown' && outcome.status !== 'error') {
+                try {
+                  console.log(`[External API] Would send outcome for ${callSid} to external API.`);
+                } catch (apiErr) {
+                  console.error('[External API] Failed to send outcome:', apiErr);
+                }
+              }
+
+              await endCall(callSid, durationSecs, JSON.stringify(recordingUrls), transcript, finalCost, costBreakdown);
+            } catch (err) {
+              console.error('[TwilioTelephony] Error in background finishCall task:', err);
+              try {
+                await endCall(callSid, durationSecs, null, transcript, finalCost, costBreakdown);
+              } catch (innerErr) {
+                console.error('[TwilioTelephony] Failed to even end call in DB:', innerErr);
+              }
+            }
+          })();
+        }
+      };
 
       ws.on('message', async (raw) => {
         const data = JSON.parse(raw.toString());
 
         if (data.event === 'start') {
           const streamSid = data.start.streamSid;
-          const callSid = data.start.callSid;
+          callSid = data.start.callSid;
           req.log.info({ streamSid, callSid }, 'call started');
-
-          customerStream = fs.createWriteStream(path.join(recordingsDir, `${callSid}-customer.raw`));
-          botStream = fs.createWriteStream(path.join(recordingsDir, `${callSid}-bot.raw`));
 
           const pre = this.prewarmed.get(callSid);
           if (pre) {
             pipeline = pre.pipeline;
+            toNumber = pipeline.agent?.context?.toNumber || 'unknown';
             await pre.prewarmPromise;
             this.prewarmed.delete(callSid);
             this.callContexts.delete(callSid);
             console.log(`[Pre-warm] Using pre-warmed pipeline for ${callSid}`);
           } else {
-            const context = this.callContexts.get(callSid);
+            const context = this.callContexts.get(callSid) || {};
+            toNumber = context.toNumber || 'unknown';
             pipeline = this.pipelineFactory(context);
             this.callContexts.delete(callSid);
             await pipeline.prewarm();
           }
 
+          // Log start call to observability
+          await startCall(callSid, toNumber, pipeline.agent?.name || 'unknown');
+
           transport = new TwilioTransport(ws, streamSid);
           
+          // Listen to outbound bot audio
           transport.on('outboundMedia', (b64) => {
-            if (botStream) {
-              botStream.write(Buffer.from(b64, 'base64'));
-            }
+            const audioChunk = Buffer.from(b64, 'base64');
+            botAudioBuffer = Buffer.concat([botAudioBuffer, audioChunk]);
           });
 
           pipeline.attachTransport(transport);
@@ -902,12 +1077,12 @@ export class TwilioTelephony extends TelephonyProvider {
         }
 
         if (data.event === 'media' && pipeline && pipeline.isStarted) {
+          const audioChunk = Buffer.from(data.media.payload, 'base64');
+          customerAudioBuffer = Buffer.concat([customerAudioBuffer, audioChunk]);
+
           if (!firstMediaLogged && pipeline.startTime) {
             firstMediaLogged = true;
             console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);
-          }
-          if (customerStream && data.media?.payload) {
-            customerStream.write(Buffer.from(data.media.payload, 'base64'));
           }
           pipeline.handleIncomingAudio(data.media.payload);
         }
@@ -916,17 +1091,13 @@ export class TwilioTelephony extends TelephonyProvider {
           transport.emit('mark', data.mark?.name);
         }
 
-        if (data.event === 'stop' && pipeline) {
-          pipeline.stop();
-          customerStream?.end();
-          botStream?.end();
+        if (data.event === 'stop') {
+          await finishCall();
         }
       });
 
-      ws.on('close', () => {
-        pipeline?.stop();
-        customerStream?.end();
-        botStream?.end();
+      ws.on('close', async () => {
+        await finishCall();
       });
     };
   }
@@ -980,7 +1151,7 @@ import { TTSProvider } from '../../core/interfaces.js';
 
 export class ElevenLabsTTS extends TTSProvider {
   constructor({ apiKey, voiceId, model, outputFormat, optimizeStreamingLatency = 4,
-                inactivityTimeout = 180, onAudio, onOpen }) {
+                inactivityTimeout = 180, speed = 1.0, onAudio, onOpen }) {
     super({ onAudio });
     this.apiKey = apiKey;
     this.voiceId = voiceId;
@@ -988,6 +1159,7 @@ export class ElevenLabsTTS extends TTSProvider {
     this.outputFormat = outputFormat;
     this.optimizeStreamingLatency = optimizeStreamingLatency;
     this.inactivityTimeout = inactivityTimeout;
+    this.speed = speed;
     this.onOpen = onOpen;
     this.ws = null;
     this.queue = [];
@@ -1015,7 +1187,7 @@ export class ElevenLabsTTS extends TTSProvider {
         opened = true;
         this.ws.send(JSON.stringify({
           text: ' ',
-          voice_settings: { stability: 0.45, similarity_boost: 0.8 },
+          voice_settings: { stability: 0.45, similarity_boost: 0.8, speed: this.speed },
           generation_config: { chunk_length_schedule: [50, 90, 120], flush_after_eos: true },
         }));
         while (this.queue.length) this.ws.send(this.queue.shift());
@@ -1081,11 +1253,11 @@ export class ElevenLabsTTS extends TTSProvider {
   }
 
   // Static REST prefetch for filler cache (independent of WS lifecycle)
-  static async prefetch({ apiKey, voiceId, model, outputFormat, text }) {
+  static async prefetch({ apiKey, voiceId, model, outputFormat, text, speed = 1.0 }) {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
       method: 'POST',
       headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
+      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75, speed } }),
     });
     if (!res.ok) throw new Error(`ElevenLabs TTS HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer()).toString('base64');
@@ -1201,51 +1373,56 @@ const DEFAULT_CONTEXT = {
 export const linenGrassReminderAgent = {
   name: 'linengrass-reminder',
 
-  // Default context (overridden by API payloads)
   context: DEFAULT_CONTEXT,
 
-  // Dynamic system prompt (receives context)
-  systemPrompt: (ctx) =>
-    `You are Krish, a natural, human-sounding assistant from LinenGrass calling ${ctx.hotelName}. ` +
-    `Forget robotic conversations. Speak like a real human taking turns. Do not dump information all at once. ` +
-    `Follow this exact conversation flow:\n` +
-    `1. You just asked for the customer. If they confirmed they are ${ctx.contactName}, greet them.\n` +
-    `2. Ask if they have placed today's order yet. Wait for their response.\n` +
-    `3. If they say no or hesitate, tell them to place the order in the LinenGrass app. Mention that delaying causes issues for supply. ` +
-    `Ask them exactly what time or when they will place the order today.\n` +
-    `4. Get their confirmation on the timing (e.g. they say "by evening" or "in one hour"), acknowledge it, and tell them to make sure they place the order in the LinenGrass application only.\n` +
-    `5. Only if they ask about past orders, use this info: Last order was on ${ctx.lastOrder?.date}, ID: ${ctx.lastOrder?.id}, for ${ctx.lastOrder?.products}.\n\n` +
-    `CRITICAL RULES:\n` +
-    `- DEFAULT LANGUAGE IS ENGLISH. You must reply in English unless the user speaks to you strictly in Hindi or Kannada.\n` +
-    `- If the user speaks Hindi, reply in native Devanagari script (हिंदी). If they speak Kannada, reply in native Kannada script (ಕನ್ನಡ).\n` +
-    `- DO NOT translate English words to Hindi. If the user speaks English, even with an Indian accent, reply in English.\n` +
-    `- Ask ONE question at a time. Wait for the user to reply.\n` +
-    `- Answer in under 15 words. Never use markdown.\n` +
-    `- Speak numbers as words (e.g., say "two" instead of "2").\n` +
-    `- You are an AI. You cannot transfer the call. Never invent names of supervisors.\n` +
-    `- Be direct, friendly, and helpful.`,
 
-  // Greeting played on call connect (Shortened to sound human)
+  // ── Improved System Prompt ────────────────────────────
+  systemPrompt: (ctx) =>
+    `You are Krish, a friendly but concise assistant from LinenGrass calling ${ctx.hotelName}. ` +
+    `Your goal is to ensure ${ctx.contactName} places their daily linen order using the LinenGrass app.\n\n` +
+    
+    `## CONTEXT\n` +
+    `- Customer: ${ctx.contactName} at ${ctx.hotelName}\n` +
+    `- Past Order (Only share if asked): Date: ${ctx.lastOrder?.date}, ID: ${ctx.lastOrder?.id}, Items: ${ctx.lastOrder?.products}\n` +
+    `- Order Deadline (Only share if asked when is the last time to order): 6 PM is the absolute deadline. Emphasize that ordering before 6 PM ensures the system can process it correctly and deliver the right linens.\n\n` +
+    
+    `## CONVERSATION FLOW\n` +
+    `(Note: The system has already played the initial greeting. Do NOT repeat the greeting.)\n` +
+    `1. **Check Order**: Ask if they have placed today's linen order yet. Wait for their answer.\n` +
+    `2. **If ALREADY PLACED**: Acknowledge politely, remind them to use the LinenGrass app, say goodbye, and end.\n` +
+    `3. **If NOT PLACED YET**: Briefly explain that delayed orders affect supply. Ask for a specific time they will place it today.\n` +
+    `4. **If THEY GIVE A TIME (e.g., "shaam tak", "in an hour")**: Acknowledge the time, remind them to use the LinenGrass app ONLY, say goodbye, and end. DO NOT ask again.\n` +
+    `5. **Refusal**: If they refuse or are angry, apologize for the disturbance, ask them to place the order when ready, and say goodbye.\n\n` +
+    
+    `## CRITICAL RULES\n` +
+    `- **Language Detection**: If the user speaks ANY Hindi or Kannada words, you MUST reply in that language using native script (Devanagari for Hindi). ` +
+    `For example, if the user says "mai aaj shaam tak kar dunga", you MUST reply in Hindi Devanagari script. Do not reply in English just because they said "thank you".\n` +
+    `- **Brevity**: Keep responses under 20 words. Do not use markdown or special characters.\n` +
+    `- **Pacing**: Ask ONE question at a time.\n` +
+    `- **Numbers**: Always speak numbers as words (e.g., "two" instead of "2").\n` +
+    `- **No Robotic Praise**: NEVER say "congratulations". Just acknowledge their commitment simply (e.g., "ठीक है, शाम तक LinenGrass ऐप पर ऑर्डर कर दें। धन्यवाद।").\n` +
+    `- **No Loops**: If the user confirms the order is placed OR gives a time commitment, DO NOT ask again. Say goodbye and stop.\n` +
+    `- **Identity**: You are an AI. You cannot transfer the call.`,
+  // Greeting played on call connect (Handled by TTS directly, LLM doesn't need to generate this)
   greeting: (ctx) =>
     `Hi, this is Krish from LinenGrass. Is this ${ctx.contactName || 'the manager'}?`,
 
-  // Cached filler phrases to mask LLM latency
   fillers: [
-    'Let me check that.',
-    'One second.',
-    'Okay, let me see.',
-    'Sure, let me check your last order details.',
+    'Hmm.',
+    'Okay.',
+    'Right.',
+    'Mhmm.',
+    'Yeah'
   ],
 
-  // ── Provider config (swap any of these) ────────────────
   providers: {
     stt: {
       name: 'elevenlabs',
       model: 'scribe_v2_realtime',
-      language: null, // Enable auto-detection of language (English/Hindi/Kannada)
+      language: 'en', 
       audioFormat: 'ulaw_8000',
-      vadSilenceThresholdSecs: 1.25,
-      vadThreshold: 0.90,
+      vadSilenceThresholdSecs: 1.10, // Increased to give users more time when taking pauses
+      vadThreshold: 0.85,
       minVolumeThreshold: 0.25,
     },
     tts: {
@@ -1253,18 +1430,18 @@ export const linenGrassReminderAgent = {
       voiceId: process.env.ELEVENLABS_VOICE_ID,
       model: 'eleven_flash_v2_5',
       outputFormat: 'ulaw_8000',
+      speed: 0.90, // Slow down speaking pace (range: 0.7 to 1.2) for better Hindi clarity
     },
     llm: {
       name: 'openai-compat',
       apiKey: process.env.GROQ_API_KEY,
       baseURL: 'https://api.groq.com/openai/v1',
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       temperature: 0,
-      maxTokens: 500,
+      maxTokens: 100,
     },
   },
 
-  // ── Behaviour tuning ───────────────────────────────────
   bargeIn: {
     greetingDurationMs: 3000,
     lockMs: 800,
@@ -1276,7 +1453,6 @@ export const linenGrassReminderAgent = {
 
   conversation: { maxHistory: 12 },
 
-  // ── Cost tracking rates ────────────────────────────────
   costTracking: {
     twilioVoicePerMin: 0.014,
     twilioStreamPerMin: 0.004,
@@ -1286,7 +1462,6 @@ export const linenGrassReminderAgent = {
     ttsPer1kChars: 0.015,
   },
 };
-
 ```
 
 ---
@@ -1335,7 +1510,7 @@ export const orderStatusAgent = {
       model: 'scribe_v2_realtime',
       language: 'en',
       audioFormat: 'ulaw_8000',
-      vadSilenceThresholdSecs: 1.25,
+      vadSilenceThresholdSecs: 1.50, // Increased to give users more time when taking pauses
       vadThreshold: 0.90,
       minVolumeThreshold: 0.25,
     },
@@ -1344,12 +1519,13 @@ export const orderStatusAgent = {
       voiceId: process.env.ELEVENLABS_VOICE_ID,
       model: 'eleven_flash_v2_5',
       outputFormat: 'ulaw_8000',
+      speed: 0.90, // Slow down speaking pace (range: 0.7 to 1.2) for better clarity
     },
     llm: {
       name: 'openai-compat',
       apiKey: process.env.GROQ_API_KEY,
       baseURL: 'https://api.groq.com/openai/v1',
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       temperature: 0,
       maxTokens: 100,
     },
@@ -1388,10 +1564,12 @@ export const orderStatusAgent = {
 // src/server/createServer.js
 import Fastify from 'fastify';
 import fastifyWs from '@fastify/websocket';
+import { attachObservabilityWebSocket } from '../services/ObservabilityService.js';
 
 export async function createServer({ telephony, port = 3000 }) {
   const app = Fastify({ logger: true });
   await app.register(fastifyWs);
+  attachObservabilityWebSocket(app);
 
   // URL-encoded body parser for Twilio webhooks
   app.addContentTypeParser('application/x-www-form-urlencoded', (req, payload, done) => {
@@ -1445,6 +1623,305 @@ export async function makeCall(telephony, { to = config.TO_NUMBER } = {}) {
   const call = await telephony.createCall({ to, machineDetection: true });
   console.log('Calling', call.sid);
   return call;
+}
+
+```
+
+---
+
+## File: `src/utils/wav.js`
+
+```javascript
+// src/utils/wav.js
+
+/**
+ * Injects a 44-byte WAV header for 8kHz, 8-bit, mono µ-law audio.
+ * @param {Buffer} rawAudioBuffer - The raw µ-law audio bytes from Twilio
+ * @returns {Buffer} - A perfectly valid WAV file buffer
+ */
+export function createWavBuffer(rawAudioBuffer) {
+  const sampleRate = 8000;
+  const numChannels = 1;
+  const bitsPerSample = 8;
+  const audioFormat = 7; // 7 = µ-law. (DO NOT USE 1, which is PCM)
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const chunkSize = 36 + rawAudioBuffer.length;
+  const subChunkSize = rawAudioBuffer.length;
+
+  const header = Buffer.alloc(44);
+
+  // RIFF header
+  header.write('RIFF', 0);
+  header.writeUInt32LE(chunkSize, 4);
+  header.write('WAVE', 8);
+
+  // fmt subchunk
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);         // Subchunk1 size for PCM/µ-law
+  header.writeUInt16LE(audioFormat, 20); // 7 = µ-law
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+
+  // data subchunk
+  header.write('data', 36);
+  header.writeUInt32LE(subChunkSize, 40);
+
+  return Buffer.concat([header, rawAudioBuffer]);
+}
+
+
+```
+
+---
+
+## File: `src/services/IntentService.js`
+
+```javascript
+// src/services/IntentService.js
+import OpenAI from 'openai';
+import { config } from '../config.js';
+
+export async function extractCallOutcome(transcript) {
+  if (!transcript || transcript.length === 0) return { status: 'unknown' };
+  
+  const client = new OpenAI({
+    apiKey: config.GROQ_API_KEY,
+    baseURL: 'https://api.groq.com/openai/v1'
+  });
+
+  const transcriptText = transcript
+    .map(m => `${m.role}: ${m.content}`)
+    .join('\n');
+
+  try {
+    const response = await client.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0,
+      max_tokens: 100,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `Analyze the phone call transcript. Identify the user's final commitment regarding placing their linen order. 
+Return ONLY a JSON object with a "status" field and a "details" field.
+Status must be one of: "already_placed", "will_place_today", "no_requirement_today", "refused", "callback_requested", "busy_or_hangup", "wrong_number_or_person", "unknown".
+
+CRITICAL CLASSIFICATION RULES:
+1. Only set status to "will_place_today" or "already_placed" if the USER explicitly states, confirms, or agrees to it. 
+2. DO NOT attribute suggestions made by the bot (e.g., the bot asking "Will you order by evening?") as a user commitment unless the user explicitly confirms (e.g., "Yes", "I will", "Okay").
+3. If the user indicates they cannot hear, cannot understand, or if the conversation ends in confusion/audio issues without any commitment, classify status as "unknown" or "busy_or_hangup".
+4. If "will_place_today" or "callback_requested", extract the time/details in "details" (e.g., "evening", "1 hour", "shaam tak", "tomorrow at 10 AM"). 
+5. If "no_requirement_today", set "details" to "no requirement".`
+        },
+        { role: 'user', content: transcriptText }
+      ],
+    });
+
+    return JSON.parse(response.choices[0].message.content);
+  } catch (err) {
+    console.error('[IntentService] Error extracting outcome:', err);
+    return { status: 'error', details: err.message };
+  }
+}
+
+```
+
+---
+
+## File: `src/services/ObservabilityService.js`
+
+```javascript
+import pg from 'pg';
+import { config } from '../config.js';
+
+const { Pool } = pg;
+
+// Create pool if DATABASE_URL is defined, otherwise fallback gracefully for testing
+let pool = null;
+if (config.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: config.DATABASE_URL,
+    ssl: config.DATABASE_URL.includes('sslmode=require') ? { rejectUnauthorized: false } : false
+  });
+  pool.on('error', (err) => {
+    console.error('Unexpected error on idle pg client', err);
+  });
+} else {
+  console.warn('DATABASE_URL is not set. Database operations will be mocked.');
+}
+
+const clients = new Set();
+
+function broadcast(event) {
+  const message = JSON.stringify(event);
+  for (const client of clients) {
+    if (client.readyState === 1) { // OPEN
+      try {
+        client.send(message);
+      } catch (err) {
+        console.error('Error broadcasting event to WS client', err);
+      }
+    }
+  }
+}
+
+export async function startCall(callSid, toNumber, agentName, timestamp = new Date()) {
+  console.log(`[Observability] startCall: ${callSid}, ${toNumber}, ${agentName}`);
+  const eventTime = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  const event = {
+    type: 'start_call',
+    callSid,
+    toNumber,
+    agentName,
+    startedAt: eventTime.toISOString()
+  };
+  broadcast(event);
+
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO calls (call_sid, to_number, status, started_at, agent_name) 
+       VALUES ($1, $2, 'in-progress', $3, $4)
+       ON CONFLICT (call_sid) DO UPDATE 
+       SET to_number = EXCLUDED.to_number, status = 'in-progress', agent_name = EXCLUDED.agent_name`,
+      [callSid, toNumber, eventTime, agentName]
+    );
+  } catch (err) {
+    console.error('Error inserting call into DB:', err);
+  }
+}
+
+export async function endCall(callSid, duration, recordingUrl, transcript, totalCost, costBreakdown) {
+  console.log(`[Observability] endCall: ${callSid}, duration: ${duration}, url: ${recordingUrl}, cost: ${totalCost}`);
+  const event = {
+    type: 'end_call',
+    callSid,
+    durationSecs: duration,
+    recordingUrl,
+    transcript,
+    totalCost,
+    costBreakdown,
+    endedAt: new Date().toISOString()
+  };
+  broadcast(event);
+
+  if (!pool) return;
+  try {
+    await pool.query(
+      `UPDATE calls 
+       SET status = 'completed', ended_at = NOW(), duration_secs = $1, recording_url = $2, transcript = $3, total_cost = $4, cost_breakdown = $5
+       WHERE call_sid = $6`,
+      [duration, recordingUrl, JSON.stringify(transcript), totalCost, JSON.stringify(costBreakdown), callSid]
+    );
+  } catch (err) {
+    console.error('Error updating call in DB:', err);
+  }
+}
+
+export async function logEvent(callSid, eventType, payload, timestamp = new Date()) {
+  console.log(`[Observability] logEvent: ${callSid}, type: ${eventType}`);
+  const eventTime = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  const event = {
+    type: 'call_event',
+    callSid,
+    eventType,
+    payload,
+    createdAt: eventTime.toISOString()
+  };
+  broadcast(event);
+
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO call_events (call_sid, event_type, payload, created_at) 
+       VALUES ($1, $2, $3, $4)`,
+      [callSid, eventType, JSON.stringify(payload), eventTime]
+    );
+  } catch (err) {
+    console.error('Error inserting call event into DB:', err);
+  }
+}
+
+export function attachObservabilityWebSocket(server) {
+  server.get('/ws/observability', { websocket: true }, (connection, req) => {
+    const ws = connection.socket ?? connection;
+    clients.add(ws);
+    console.log(`[Observability WS] Client connected. Total clients: ${clients.size}`);
+    
+    ws.on('close', () => {
+      clients.delete(ws);
+      console.log(`[Observability WS] Client disconnected. Total clients: ${clients.size}`);
+    });
+
+    ws.on('error', (err) => {
+      console.error('[Observability WS] Socket error', err);
+      clients.delete(ws);
+    });
+  });
+}
+
+```
+
+---
+
+## File: `src/services/S3Service.js`
+
+```javascript
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { config } from '../config.js';
+
+let s3Client = null;
+if (config.AWS_ACCESS_KEY_ID && config.AWS_ACCESS_KEY_ID !== 'xxx') {
+  s3Client = new S3Client({
+    region: config.AWS_REGION,
+    credentials: {
+      accessKeyId: config.AWS_ACCESS_KEY_ID,
+      secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
+    },
+  });
+} else {
+  console.warn('AWS S3 credentials are not configured. S3 uploads will return mocked public URLs.');
+}
+
+export async function uploadWavFile(callSid, trackName, wavBuffer) {
+  const key = `recordings/${callSid}-${trackName}.wav`;
+  const bucketName = config.AWS_S3_BUCKET || 'linengrass-recordings';
+  const region = config.AWS_REGION || 'us-east-1';
+  const publicUrl = `https://${bucketName}.s3.${region}.amazonaws.com/${key}`;
+
+  console.log(`[S3Service] Uploading ${key} to bucket ${bucketName}...`);
+
+  if (!s3Client) {
+    console.log(`[S3Service] Mock upload complete. URL: ${publicUrl}`);
+    return publicUrl;
+  }
+
+  try {
+    const command = new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: wavBuffer,
+      ContentType: 'audio/wav',
+    });
+    await s3Client.send(command);
+
+    // Generate a 7-day presigned URL (604800 seconds)
+    const getCommand = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+    });
+    const presignedUrl = await getSignedUrl(s3Client, getCommand, { expiresIn: 604800 });
+    console.log(`[S3Service] Upload success. Presigned URL: ${presignedUrl}`);
+    return presignedUrl;
+  } catch (err) {
+    console.error(`[S3Service] Upload failed for ${key}:`, err);
+    return publicUrl;
+  }
 }
 
 ```

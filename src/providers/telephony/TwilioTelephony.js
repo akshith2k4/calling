@@ -2,9 +2,10 @@
 import twilio from 'twilio';
 import { TelephonyProvider } from '../../core/interfaces.js';
 import { TwilioTransport } from './TwilioTransport.js';
-import { startCall, endCall } from '../../services/ObservabilityService.js';
+import { startCall, endCall, logEvent } from '../../services/ObservabilityService.js';
 import { createWavBuffer } from '../../utils/wav.js';
 import { uploadWavFile } from '../../services/S3Service.js';
+import { extractCallOutcome } from '../../services/IntentService.js';
 
 export class TwilioTelephony extends TelephonyProvider {
   constructor({ accountSid, authToken, fromNumber, domain, pipelineFactory }) {
@@ -108,6 +109,23 @@ export class TwilioTelephony extends TelephonyProvider {
               ]);
 
               const recordingUrls = { customer: customerUrl, bot: botUrl };
+              
+              // Extract call outcome/status using IntentService
+              const outcome = await extractCallOutcome(transcript);
+              if (callSid) {
+                await logEvent(callSid, 'call_outcome', outcome);
+              }
+              console.log(`[Intent] Call ${callSid} outcome:`, outcome);
+
+              // ── SEND TO YOUR EXTERNAL API ──
+              if (outcome.status !== 'unknown' && outcome.status !== 'error') {
+                try {
+                  console.log(`[External API] Would send outcome for ${callSid} to external API.`);
+                } catch (apiErr) {
+                  console.error('[External API] Failed to send outcome:', apiErr);
+                }
+              }
+
               await endCall(callSid, durationSecs, JSON.stringify(recordingUrls), transcript, finalCost, costBreakdown);
             } catch (err) {
               console.error('[TwilioTelephony] Error in background finishCall task:', err);

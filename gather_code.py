@@ -12,7 +12,8 @@ IGNORE_DIRS = {
     '.venv',
     'env',
     '.env',
-    '__pycache__'
+    '__pycache__',
+    'dashboard'
 }
 
 # Specific files to ignore

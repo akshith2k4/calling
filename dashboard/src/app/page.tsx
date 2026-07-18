@@ -557,6 +557,10 @@ export default function Dashboard() {
                         badgeColor = 'bg-rose-500/10 text-rose-400 border border-rose-500/20';
                         desc = `True Voice Latency: ${evt.payload?.ms || 0}ms` +
                                (evt.payload?.fillerPlayed && evt.payload?.fillerMs ? ` + Filler: ${evt.payload.fillerMs}ms (Perceived Silence-to-Speech: ${evt.payload.perceivedMs}ms)` : '');
+                      } else if (evt.event_type === 'call_outcome') {
+                        badgeColor = 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20';
+                        desc = `Call Outcome Status: "${evt.payload?.status || ''}"` +
+                               (evt.payload?.details ? ` (Details: "${evt.payload.details}")` : '');
                       } else {
                         desc = evt.event_type;
                       }

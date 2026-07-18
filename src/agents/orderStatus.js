@@ -39,7 +39,7 @@ export const orderStatusAgent = {
       model: 'scribe_v2_realtime',
       language: 'en',
       audioFormat: 'ulaw_8000',
-      vadSilenceThresholdSecs: 1.25,
+      vadSilenceThresholdSecs: 1.50, // Increased to give users more time when taking pauses
       vadThreshold: 0.90,
       minVolumeThreshold: 0.25,
     },
@@ -48,6 +48,7 @@ export const orderStatusAgent = {
       voiceId: process.env.ELEVENLABS_VOICE_ID,
       model: 'eleven_flash_v2_5',
       outputFormat: 'ulaw_8000',
+      speed: 0.90, // Slow down speaking pace (range: 0.7 to 1.2) for better clarity
     },
     llm: {
       name: 'openai-compat',

@@ -272,6 +272,10 @@ export class VoicePipeline {
           });
         }
         console.log(`[Latency] True Voice Latency: ${latencyMs}ms (filler: ${fillerMs}ms, perceived: ${perceivedMs}ms)`);
+        
+        // Interrupt/clear the Twilio playback queue to cut off the filler instantly
+        console.log('[Filler] Cutting off filler playback to play actual response');
+        this.transport.sendClear();
       } else {
         if (this.callSid) {
           logEvent(this.callSid, 'true_voice_latency', { 

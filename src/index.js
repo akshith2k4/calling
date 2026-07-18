@@ -18,6 +18,7 @@ async function main() {
       model: agent.providers.tts.model,
       outputFormat: agent.providers.tts.outputFormat,
       text,
+      speed: agent.providers.tts.speed || 1.0,
     }),
   });
   await fillers.prewarm();

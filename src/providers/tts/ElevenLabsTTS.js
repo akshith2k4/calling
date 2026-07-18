@@ -4,7 +4,7 @@ import { TTSProvider } from '../../core/interfaces.js';
 
 export class ElevenLabsTTS extends TTSProvider {
   constructor({ apiKey, voiceId, model, outputFormat, optimizeStreamingLatency = 4,
-                inactivityTimeout = 180, onAudio, onOpen }) {
+                inactivityTimeout = 180, speed = 1.0, onAudio, onOpen }) {
     super({ onAudio });
     this.apiKey = apiKey;
     this.voiceId = voiceId;
@@ -12,6 +12,7 @@ export class ElevenLabsTTS extends TTSProvider {
     this.outputFormat = outputFormat;
     this.optimizeStreamingLatency = optimizeStreamingLatency;
     this.inactivityTimeout = inactivityTimeout;
+    this.speed = speed;
     this.onOpen = onOpen;
     this.ws = null;
     this.queue = [];
@@ -39,7 +40,7 @@ export class ElevenLabsTTS extends TTSProvider {
         opened = true;
         this.ws.send(JSON.stringify({
           text: ' ',
-          voice_settings: { stability: 0.45, similarity_boost: 0.8 },
+          voice_settings: { stability: 0.45, similarity_boost: 0.8, speed: this.speed },
           generation_config: { chunk_length_schedule: [50, 90, 120], flush_after_eos: true },
         }));
         while (this.queue.length) this.ws.send(this.queue.shift());
@@ -105,11 +106,11 @@ export class ElevenLabsTTS extends TTSProvider {
   }
 
   // Static REST prefetch for filler cache (independent of WS lifecycle)
-  static async prefetch({ apiKey, voiceId, model, outputFormat, text }) {
+  static async prefetch({ apiKey, voiceId, model, outputFormat, text, speed = 1.0 }) {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
       method: 'POST',
       headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
+      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75, speed } }),
     });
     if (!res.ok) throw new Error(`ElevenLabs TTS HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer()).toString('base64');

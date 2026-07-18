@@ -32,4 +32,14 @@ export class FillerManager {
   get(text) {
     return this.cache[text];
   }
+
+  async prewarmText(text) {
+    if (!this.prefetchFn) return;
+    try {
+      this.cache[text] = await this.prefetchFn(text);
+      console.log(`[Filler Cache] Custom Pre-warmed: "${text}" (${this.cache[text].length} bytes)`);
+    } catch (err) {
+      console.error(`[Filler Cache] Failed to cache custom text "${text}":`, err.message);
+    }
+  }
 }
