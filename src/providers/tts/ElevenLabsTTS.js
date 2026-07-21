@@ -3,7 +3,7 @@ import WebSocket from 'ws';
 import { TTSProvider } from '../../core/interfaces.js';
 
 export class ElevenLabsTTS extends TTSProvider {
-  constructor({ apiKey, voiceId, model, outputFormat, optimizeStreamingLatency = 4,
+  constructor({ apiKey, voiceId, model, outputFormat, optimizeStreamingLatency = 3,
                 inactivityTimeout = 180, speed = 1.0, onAudio, onOpen }) {
     super({ onAudio });
     this.apiKey = apiKey;
@@ -40,8 +40,15 @@ export class ElevenLabsTTS extends TTSProvider {
         opened = true;
         this.ws.send(JSON.stringify({
           text: ' ',
-          voice_settings: { stability: 0.45, similarity_boost: 0.8, speed: this.speed },
-          generation_config: { chunk_length_schedule: [50, 90, 120], flush_after_eos: true },
+          voice_settings: {
+            stability: 0.60,          // Was 0.45 → more consistent pacing
+            similarity_boost: 0.65,   // Was 0.80 → less English-phoneme forcing
+            speed: this.speed,
+          },
+          generation_config: {
+            chunk_length_schedule: [120, 160, 200],  // Was [50, 90, 120] → longer natural phrases
+            flush_after_eos: true,
+          },
         }));
         while (this.queue.length) this.ws.send(this.queue.shift());
         this.onOpen?.();
@@ -63,6 +70,7 @@ export class ElevenLabsTTS extends TTSProvider {
         console.log(`[TTS] Closed: ${c}`);
         if (!opened) resolve();
         if (!this.isClosedExplicitly && (c === 1006 || c === 1005)) {
+          this.queue = [];
           console.log('[TTS] Reconnecting in 1s...');
           setTimeout(() => this.connect(), 1000);
         }
@@ -102,6 +110,7 @@ export class ElevenLabsTTS extends TTSProvider {
 
   close() {
     this.isClosedExplicitly = true;
+    this.queue = [];
     try { this.ws?.close(); } catch {}
   }
 
@@ -110,7 +119,7 @@ export class ElevenLabsTTS extends TTSProvider {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
       method: 'POST',
       headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75, speed } }),
+      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.60, similarity_boost: 0.65, speed } }),
     });
     if (!res.ok) throw new Error(`ElevenLabs TTS HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer()).toString('base64');

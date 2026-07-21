@@ -18,7 +18,7 @@ export class OpenAICompatLLM extends LLMProvider {
       stream: true,
       temperature: this.temperature,
       max_tokens: this.maxTokens,
-    });
+    }, { signal });
     for await (const chunk of s) {
       if (signal?.aborted) break;
       const t = chunk.choices[0]?.delta?.content || '';

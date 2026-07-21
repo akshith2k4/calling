@@ -54,7 +54,7 @@ export class BargeInController {
     }
     this.lastPartialTime = now;
 
-    if (text.length > this.minLength && now - this.speechStart > this.speechStartMs) {
+    if (text.length >= this.minLength && now - this.speechStart >= this.speechStartMs) {
       const lower = text.toLowerCase().trim();
       if (this.backchannels.includes(lower)) return false;
       if (text.trim().split(/\s+/).length < this.minWords) return false;

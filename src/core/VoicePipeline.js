@@ -38,6 +38,11 @@ export class VoicePipeline {
     this.lastFiller = null;
     this.prewarmPromise = null;
     this.isStarted = false;
+
+    // Additional state initialization
+    this.trueLatencyStart = null;
+    this.fillerPlayedThisTurn = false;
+    this.lastFillerPlayTime = 0;
   }
 
   // ─── Lifecycle ───────────────────────────────────────────
@@ -55,9 +60,6 @@ export class VoicePipeline {
     this.tts.onAudio = (b64, isFinal) => this._onTTSAudio(b64, isFinal);
 
     this.stt.connect();          // fire-and-forget (auto-reconnects internally)
-    if (this.callSid) {
-      logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
-    }
     await this.tts.connect();    // must be open before sending text
   }
 
@@ -87,8 +89,8 @@ export class VoicePipeline {
     } finally {
       this.aborter = null;
     }
-    try { this.stt?.close(); } catch {}
-    try { this.tts?.close(); } catch {}
+    try { this.stt?.close(); } catch (err) { console.error('[Pipeline] Error closing STT:', err); }
+    try { this.tts?.close(); } catch (err) { console.error('[Pipeline] Error closing TTS:', err); }
     this.cost.report(this.startTime);
   }
 
@@ -100,7 +102,7 @@ export class VoicePipeline {
       : this.agent.greeting;
 
     this.conversation.pushAssistant(greet);
-    greet.split(/(\s+)/).forEach(w => this.tts.sendTextChunk(w, true));
+    greet.split(/(\s+)/).filter(w => w.trim()).forEach(w => this.tts.sendTextChunk(w, true));
     this.tts.flush();
 
     this.bargeIn.lockForGreeting(this.agent.bargeIn?.greetingDurationMs ?? 2500);
@@ -115,6 +117,8 @@ export class VoicePipeline {
       }
       return;
     }
+
+    if (this.bargeIn.isGreeting) return; // Block final transcripts during the greeting
 
     // Final committed transcript
     if (this.isProcessing) return;
@@ -226,7 +230,7 @@ export class VoicePipeline {
           isFirstChunk = false;
         }
       } else {
-        if (/[\,\.\?\!\;]$/.test(buffer) || (buffer.length >= 40 && /\s$/.test(buffer))) {
+        if (/(\.\.\.|[\,\.\?\!\;])$/.test(buffer) || (buffer.length >= 40 && /\s$/.test(buffer))) {
           this.tts.sendTextChunk(buffer, true);
           buffer = '';
         }
@@ -237,8 +241,9 @@ export class VoicePipeline {
     if (buffer) this.tts.sendTextChunk(buffer, true);
     this.tts.flush();
 
+    const inputJson = this.conversation.toJSON();
     this.conversation.pushAssistant(full);
-    this.cost.trackLLM(this.conversation.toJSON(), full);
+    this.cost.trackLLM(inputJson, full);
     console.log(`[LLM] Response: "${full}"`);
     if (this.callSid) {
       logEvent(this.callSid, 'llm_response', { text: full });
@@ -248,6 +253,8 @@ export class VoicePipeline {
   // ─── TTS Callbacks ───────────────────────────────────────
 
   _onTTSAudio(b64, isFinal) {
+    if (!this.transport) return;
+
     if (this.bargeIn.isGreeting && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
       const latency = Date.now() - this.startTime;
@@ -284,11 +291,6 @@ export class VoicePipeline {
           });
         }
         console.log(`[Latency] True Voice Latency (no filler): ${latencyMs}ms`);
-      }
-      
-      const latency = Date.now() - this.currentTurnStart;
-      if (this.callSid) {
-        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
       }
     } else if (this.currentTurnStart && !this.firstAudioLogged) {
       this.firstAudioLogged = true;

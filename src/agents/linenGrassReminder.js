@@ -1,5 +1,7 @@
 // src/agents/linenGrassReminder.js
 
+import { content } from "@elevenlabs/elevenlabs-js/api/resources/studio/resources/projects";
+
 const DEFAULT_CONTEXT = {
   hotelName: 'Grand Hyatt Hotel',
   contactName: 'Akshith',
@@ -18,35 +20,47 @@ export const linenGrassReminderAgent = {
 
   // ── Improved System Prompt ────────────────────────────
   systemPrompt: (ctx) =>
-    `You are Krish, a friendly but concise assistant from LinenGrass calling ${ctx.hotelName}. ` +
-    `Your goal is to ensure ${ctx.contactName} places their daily linen order using the LinenGrass app.\n\n` +
+    `You are Krish, a polite and friendly assistant from LinenGrass calling ${ctx.hotelName}. ` +
+    `You are having a natural, spoken conversation with ${ctx.contactName}. Your goal is to gently ensure they place their daily linen order using the LinenGrass app.\n\n` +
     
     `## CONTEXT\n` +
     `- Customer: ${ctx.contactName} at ${ctx.hotelName}\n` +
     `- Past Order (Only share if asked): Date: ${ctx.lastOrder?.date}, ID: ${ctx.lastOrder?.id}, Items: ${ctx.lastOrder?.products}\n` +
-    `- Order Deadline (Only share if asked when is the last time to order): 6 PM is the absolute deadline. Emphasize that ordering before 6 PM ensures the system can process it correctly and deliver the right linens.\n\n` +
+    `- Order Deadline: 6 PM.\n\n` 
+    
     
     `## CONVERSATION FLOW\n` +
-    `(Note: The system has already played the initial greeting. Do NOT repeat the greeting.)\n` +
-    `1. **Check Order**: Ask if they have placed today's linen order yet. Wait for their answer.\n` +
-    `2. **If ALREADY PLACED**: Acknowledge politely, remind them to use the LinenGrass app, say goodbye, and end.\n` +
-    `3. **If NOT PLACED YET**: Briefly explain that delayed orders affect supply. Ask for a specific time they will place it today.\n` +
-    `4. **If THEY GIVE A TIME (e.g., "shaam tak", "in an hour")**: Acknowledge the time, remind them to use the LinenGrass app ONLY, say goodbye, and end. DO NOT ask again.\n` +
-    `5. **Refusal**: If they refuse or are angry, apologize for the disturbance, ask them to place the order when ready, and say goodbye.\n\n` +
+    `(The system has already played the greeting. Do NOT repeat it.)\n` +
+    `1. Ask if they have placed today's linen order yet.\n` +
+    `2. If ALREADY PLACED: Acknowledge, remind them to use the LinenGrass app, say goodbye.\n` +
+    `3. If NOT PLACED: Mention delayed orders affect supply. Ask for a specific time.\n` +
+    `4. If THEY GIVE A TIME: Acknowledge, remind about the app, say goodbye. Do NOT ask again.\n` +
+    `5. If REFUSAL: Apologize, say goodbye.\n\n` +
     
-    `## CRITICAL RULES\n` +
-    `- **Language Detection**: If the user speaks ANY Hindi or Kannada words, you MUST reply in that language using native script (Devanagari for Hindi). ` +
-    `For example, if the user says "mai aaj shaam tak kar dunga", you MUST reply in Hindi Devanagari script. Do not reply in English just because they said "thank you".\n` +
-    `- **Brevity**: Keep responses under 20 words. Do not use markdown or special characters.\n` +
-    `- **Pacing**: Ask ONE question at a time.\n` +
-    `- **Numbers**: Always speak numbers as words (e.g., "two" instead of "2").\n` +
-    `- **No Robotic Praise**: NEVER say "congratulations". Just acknowledge their commitment simply (e.g., "ठीक है, शाम तक LinenGrass ऐप पर ऑर्डर कर दें। धन्यवाद।").\n` +
-    `- **No Loops**: If the user confirms the order is placed OR gives a time commitment, DO NOT ask again. Say goodbye and stop.\n` +
-    `- **Identity**: You are an AI. You cannot transfer the call.`,
-  // Greeting played on call connect (Handled by TTS directly, LLM doesn't need to generate this)
+    `## LANGUAGE RULES (CRITICAL)\n` +
+    `- The user may speak in English, Hindi, or a mix (Hinglish). Match their language.\n` +
+    `- **NEVER output Devanagari script.** Always respond in ROMANIZED Hindi (Hinglish) using English letters.\n` +
+    `- Examples of correct output:\n` +
+    `  ✓ "Theek hai... shaam tak LinenGrass app par order kar dijiye."\n` +
+    `  ✓ "Koi baat nahi... jab ready ho jaiye, app par order kar dena."\n` +
+    `  ✓ "Achha ji... aaj ka order abhi tak nahi kiya?"\n` +
+    `  ✗ "ठीक है, शाम तक ऑर्डर कर दीजिए।" (NEVER do this)\n` +
+    `- If the user speaks pure English, reply in English.\n` +
+    `- If the user mixes Hindi+English, reply in the same Hinglish mix.\n\n` +
+    
+    `## PACING & STYLE RULES\n` 
+    `- Use "..." (ellipsis) between clauses to create natural pauses. Example: "Achha ji... toh aaj shaam tak kar denge?"\n` 
+    `- Ask ONE question at a time.\n` 
+    `- Speak numbers as words: "six PM" not "6 PM", "do" not "2".\n` 
+    `- NEVER say "congratulations". Be natural.\n` 
+    `- No markdown, no bullets, no special characters.\n` 
+    `- If user confirms order or gives time, say goodbye and STOP. No loops.\n` +
+    `- You are an AI. You cannot transfer the call.`,
+    
+  // Greeting played on call connect
   greeting: (ctx) =>
-    `Hi, this is Krish from LinenGrass. Is this ${ctx.contactName || 'the manager'}?`,
-
+    // Asking for the person first, then identifying yourself, is much more human.
+    `Hi, This is Krish from LinenGrass, am i speaking to ${ctx.contactName || 'the manager'}? ... Great, this is Krish calling from LinenGrass.`,
   fillers: [
     'Hmm.',
     'Okay.',
@@ -59,18 +73,18 @@ export const linenGrassReminderAgent = {
     stt: {
       name: 'elevenlabs',
       model: 'scribe_v2_realtime',
-      language: 'en', 
+      language: 'en',                // Keep English — Hindi detection is broken
       audioFormat: 'ulaw_8000',
-      vadSilenceThresholdSecs: 1.10, // Increased to give users more time when taking pauses
-      vadThreshold: 0.85,
-      minVolumeThreshold: 0.25,
+      vadSilenceThresholdSecs: 1.40, // Was 1.10 → more patience for Hindi speakers
+      vadThreshold: 0.80,            // Was 0.85 → slightly more sensitive to quiet Hindi speech
+      minVolumeThreshold: 0.40,      // Was 0.45 → catch softer speech
     },
     tts: {
       name: 'elevenlabs',
       voiceId: process.env.ELEVENLABS_VOICE_ID,
       model: 'eleven_flash_v2_5',
       outputFormat: 'ulaw_8000',
-      speed: 0.90, // Slow down speaking pace (range: 0.7 to 1.2) for better Hindi clarity
+      speed: 1.0, 
     },
     llm: {
       name: 'openai-compat',

@@ -37,7 +37,6 @@ export class TwilioTelephony extends TelephonyProvider {
       from: this.fromNumber,
       url: `https://${this.domain}/voice`,
       machineDetection: machineDetection ? 'Enable' : undefined,
-      asyncAmd: machineDetection ? 'true' : undefined,
     });
     
     this.callContexts.set(call.sid, sanitizedContext);
@@ -63,6 +62,17 @@ export class TwilioTelephony extends TelephonyProvider {
         const pipeline = this.pipelineFactory(context);
         const prewarmPromise = pipeline.prewarm();
         this.prewarmed.set(callSid, { pipeline, prewarmPromise });
+
+        // Memory leak cleanup: if WebSocket does not connect in 60s, clean up
+        setTimeout(() => {
+          if (this.prewarmed.has(callSid)) {
+            console.log(`[Cleanup] Cleaning up stale pre-warmed pipeline for CallSid: ${callSid}`);
+            const entry = this.prewarmed.get(callSid);
+            try { entry.pipeline.stop(); } catch {}
+            this.prewarmed.delete(callSid);
+          }
+          this.callContexts.delete(callSid);
+        }, 60000);
       }
 
       reply.type('text/xml').send(
@@ -140,61 +150,65 @@ export class TwilioTelephony extends TelephonyProvider {
       };
 
       ws.on('message', async (raw) => {
-        const data = JSON.parse(raw.toString());
+        try {
+          const data = JSON.parse(raw.toString());
 
-        if (data.event === 'start') {
-          const streamSid = data.start.streamSid;
-          callSid = data.start.callSid;
-          req.log.info({ streamSid, callSid }, 'call started');
+          if (data.event === 'start') {
+            const streamSid = data.start.streamSid;
+            callSid = data.start.callSid;
+            req.log.info({ streamSid, callSid }, 'call started');
 
-          const pre = this.prewarmed.get(callSid);
-          if (pre) {
-            pipeline = pre.pipeline;
-            toNumber = pipeline.agent?.context?.toNumber || 'unknown';
-            await pre.prewarmPromise;
-            this.prewarmed.delete(callSid);
-            this.callContexts.delete(callSid);
-            console.log(`[Pre-warm] Using pre-warmed pipeline for ${callSid}`);
-          } else {
-            const context = this.callContexts.get(callSid) || {};
-            toNumber = context.toNumber || 'unknown';
-            pipeline = this.pipelineFactory(context);
-            this.callContexts.delete(callSid);
-            await pipeline.prewarm();
+            const pre = this.prewarmed.get(callSid);
+            if (pre) {
+              pipeline = pre.pipeline;
+              toNumber = pipeline.agent?.context?.toNumber || 'unknown';
+              await pre.prewarmPromise;
+              this.prewarmed.delete(callSid);
+              this.callContexts.delete(callSid);
+              console.log(`[Pre-warm] Using pre-warmed pipeline for ${callSid}`);
+            } else {
+              const context = this.callContexts.get(callSid) || {};
+              toNumber = context.toNumber || 'unknown';
+              pipeline = this.pipelineFactory(context);
+              this.callContexts.delete(callSid);
+              await pipeline.prewarm();
+            }
+
+            // Log start call to observability
+            await startCall(callSid, toNumber, pipeline.agent?.name || 'unknown');
+
+            transport = new TwilioTransport(ws, streamSid);
+            
+            // Listen to outbound bot audio
+            transport.on('outboundMedia', (b64) => {
+              const audioChunk = Buffer.from(b64, 'base64');
+              botAudioBuffer = Buffer.concat([botAudioBuffer, audioChunk]);
+            });
+
+            pipeline.attachTransport(transport);
+            pipeline.start({ callSid, streamSid });
           }
 
-          // Log start call to observability
-          await startCall(callSid, toNumber, pipeline.agent?.name || 'unknown');
+          if (data.event === 'media' && pipeline && pipeline.isStarted) {
+            const audioChunk = Buffer.from(data.media.payload, 'base64');
+            customerAudioBuffer = Buffer.concat([customerAudioBuffer, audioChunk]);
 
-          transport = new TwilioTransport(ws, streamSid);
-          
-          // Listen to outbound bot audio
-          transport.on('outboundMedia', (b64) => {
-            const audioChunk = Buffer.from(b64, 'base64');
-            botAudioBuffer = Buffer.concat([botAudioBuffer, audioChunk]);
-          });
-
-          pipeline.attachTransport(transport);
-          pipeline.start({ callSid, streamSid });
-        }
-
-        if (data.event === 'media' && pipeline && pipeline.isStarted) {
-          const audioChunk = Buffer.from(data.media.payload, 'base64');
-          customerAudioBuffer = Buffer.concat([customerAudioBuffer, audioChunk]);
-
-          if (!firstMediaLogged && pipeline.startTime) {
-            firstMediaLogged = true;
-            console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);
+            if (!firstMediaLogged && pipeline.startTime) {
+              firstMediaLogged = true;
+              console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);
+            }
+            pipeline.handleIncomingAudio(data.media.payload);
           }
-          pipeline.handleIncomingAudio(data.media.payload);
-        }
 
-        if (data.event === 'mark' && transport) {
-          transport.emit('mark', data.mark?.name);
-        }
+          if (data.event === 'mark' && transport) {
+            transport.emit('mark', data.mark?.name);
+          }
 
-        if (data.event === 'stop') {
-          await finishCall();
+          if (data.event === 'stop') {
+            await finishCall();
+          }
+        } catch (parseErr) {
+          console.error('[TwilioTelephony] Error processing WebSocket message:', parseErr);
         }
       });
 

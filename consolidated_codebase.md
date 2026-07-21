@@ -8,7 +8,7 @@ Generated from: `/Users/akshith/LG/calling`
 ```
 TWILIO_ACCOUNT_SID=ACxxx
 TWILIO_AUTH_TOKEN=xxx
-TWILIO_FROM_NUMBER=+1659251038
+TWILIO_FROM_NUMBER=+16592517038
 TO_NUMBER=+918341582042
 DOMAIN=xxxx.ngrok-free.app
 ELEVENLABS_API_KEY=eleven_xxx
@@ -39,7 +39,8 @@ AWS_S3_BUCKET=linengrass-recordings
   "scripts": {
     "start": "node src/index.js",
     "call": "node src/index.js --call",
-    "tunnel": "npx ngrok http 3000 --url spied-unlovable-playable.ngrok-free.dev"
+    "tunnel": "npx ngrok http 3000 --url spied-unlovable-playable.ngrok-free.dev",
+    "simulate": "node src/simulate.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1089.0",
@@ -177,6 +178,124 @@ main().catch(console.error);
 
 ---
 
+## File: `src/simulate.js`
+
+```javascript
+// src/simulate.js
+import readline from 'readline';
+import dotenv from 'dotenv';
+import { ConversationManager } from './core/ConversationManager.js';
+import { OpenAICompatLLM } from './providers/llm/OpenAICompatLLM.js';
+import { linenGrassReminderAgent } from './agents/linenGrassReminder.js';
+import { orderStatusAgent } from './agents/orderStatus.js';
+
+dotenv.config();
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+const agents = {
+  reminder: linenGrassReminderAgent,
+  status: orderStatusAgent
+};
+
+async function selectAgent() {
+  return new Promise((resolve) => {
+    rl.question('Select agent to test (1 for linengrass-reminder, 2 for order-status) [1]: ', (answer) => {
+      if (answer.trim() === '2') {
+        resolve('status');
+      } else {
+        resolve('reminder');
+      }
+    });
+  });
+}
+
+async function main() {
+  const agentKey = await selectAgent();
+  const agent = agents[agentKey];
+  console.log(`\n--- Simulating Agent: ${agent.name} ---`);
+  
+  // Set up context
+  const context = {
+    hotelName: "Grand Hyatt Hotel",
+    contactName: "Akshith",
+    lastOrder: {
+      id: "ORD-7762",
+      date: "July fifth",
+      products: "fifty white towels and thirty bedsheets"
+    }
+  };
+
+  const systemPrompt = typeof agent.systemPrompt === 'function'
+    ? agent.systemPrompt(context)
+    : agent.systemPrompt;
+
+  const conversation = new ConversationManager({
+    systemPrompt,
+    maxHistory: 12
+  });
+
+  const llm = new OpenAICompatLLM({
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: 'https://api.groq.com/openai/v1',
+    model: agent.llm?.model || 'llama-3.3-70b-versatile',
+    temperature: agent.llm?.temperature || 0,
+    maxTokens: agent.llm?.maxTokens || 100
+  });
+
+  const greetingText = typeof agent.greeting === 'function'
+    ? agent.greeting(context)
+    : agent.greeting;
+
+  conversation.pushAssistant(greetingText);
+  console.log(`\nBot Greeting: \x1b[32m"${greetingText}"\x1b[0m\n`);
+
+  const promptUser = () => {
+    rl.question('\nYou: ', async (userInput) => {
+      const input = userInput.trim();
+      if (input.toLowerCase() === 'exit' || input.toLowerCase() === 'quit') {
+        console.log('Exiting simulation...');
+        rl.close();
+        return;
+      }
+
+      if (!input) {
+        promptUser();
+        return;
+      }
+
+      conversation.pushUser(input);
+      process.stdout.write('Bot: \x1b[32m');
+
+      try {
+        let fullResponse = '';
+        const stream = llm.stream(conversation.getMessages());
+        for await (const chunk of stream) {
+          process.stdout.write(chunk);
+          fullResponse += chunk;
+        }
+        process.stdout.write('\x1b[0m\n');
+        conversation.pushAssistant(fullResponse);
+      } catch (err) {
+        console.log(`\x1b[31m\n[Error] LLM request failed: ${err.message}\x1b[0m`);
+      }
+
+      promptUser();
+    });
+  };
+
+  promptUser();
+}
+
+main();
+
+```
+
+---
+
 ## File: `src/core/BargeInController.js`
 
 ```javascript
@@ -236,7 +355,7 @@ export class BargeInController {
     }
     this.lastPartialTime = now;
 
-    if (text.length > this.minLength && now - this.speechStart > this.speechStartMs) {
+    if (text.length >= this.minLength && now - this.speechStart >= this.speechStartMs) {
       const lower = text.toLowerCase().trim();
       if (this.backchannels.includes(lower)) return false;
       if (text.trim().split(/\s+/).length < this.minWords) return false;
@@ -404,12 +523,10 @@ export class FillerManager {
   }
 
   getRandom(exclude) {
-    if (this.fillers.length < 2) return this.fillers[0];
-    let pick;
-    do {
-      pick = this.fillers[Math.floor(Math.random() * this.fillers.length)];
-    } while (pick === exclude);
-    return pick;
+    if (!this.fillers || this.fillers.length === 0) return undefined;
+    const available = this.fillers.filter(f => f !== exclude);
+    if (available.length === 0) return this.fillers[0];
+    return available[Math.floor(Math.random() * available.length)];
   }
 
   get(text) {
@@ -526,6 +643,11 @@ export class VoicePipeline {
     this.lastFiller = null;
     this.prewarmPromise = null;
     this.isStarted = false;
+
+    // Additional state initialization
+    this.trueLatencyStart = null;
+    this.fillerPlayedThisTurn = false;
+    this.lastFillerPlayTime = 0;
   }
 
   // ─── Lifecycle ───────────────────────────────────────────
@@ -543,9 +665,6 @@ export class VoicePipeline {
     this.tts.onAudio = (b64, isFinal) => this._onTTSAudio(b64, isFinal);
 
     this.stt.connect();          // fire-and-forget (auto-reconnects internally)
-    if (this.callSid) {
-      logEvent(this.callSid, 'stt_connect', { timestamp: Date.now() });
-    }
     await this.tts.connect();    // must be open before sending text
   }
 
@@ -575,8 +694,8 @@ export class VoicePipeline {
     } finally {
       this.aborter = null;
     }
-    try { this.stt?.close(); } catch {}
-    try { this.tts?.close(); } catch {}
+    try { this.stt?.close(); } catch (err) { console.error('[Pipeline] Error closing STT:', err); }
+    try { this.tts?.close(); } catch (err) { console.error('[Pipeline] Error closing TTS:', err); }
     this.cost.report(this.startTime);
   }
 
@@ -588,7 +707,7 @@ export class VoicePipeline {
       : this.agent.greeting;
 
     this.conversation.pushAssistant(greet);
-    greet.split(/(\s+)/).forEach(w => this.tts.sendTextChunk(w, true));
+    greet.split(/(\s+)/).filter(w => w.trim()).forEach(w => this.tts.sendTextChunk(w, true));
     this.tts.flush();
 
     this.bargeIn.lockForGreeting(this.agent.bargeIn?.greetingDurationMs ?? 2500);
@@ -603,6 +722,8 @@ export class VoicePipeline {
       }
       return;
     }
+
+    if (this.bargeIn.isGreeting) return; // Block final transcripts during the greeting
 
     // Final committed transcript
     if (this.isProcessing) return;
@@ -725,8 +846,9 @@ export class VoicePipeline {
     if (buffer) this.tts.sendTextChunk(buffer, true);
     this.tts.flush();
 
+    const inputJson = this.conversation.toJSON();
     this.conversation.pushAssistant(full);
-    this.cost.trackLLM(this.conversation.toJSON(), full);
+    this.cost.trackLLM(inputJson, full);
     console.log(`[LLM] Response: "${full}"`);
     if (this.callSid) {
       logEvent(this.callSid, 'llm_response', { text: full });
@@ -736,6 +858,8 @@ export class VoicePipeline {
   // ─── TTS Callbacks ───────────────────────────────────────
 
   _onTTSAudio(b64, isFinal) {
+    if (!this.transport) return;
+
     if (this.bargeIn.isGreeting && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
       const latency = Date.now() - this.startTime;
@@ -772,11 +896,6 @@ export class VoicePipeline {
           });
         }
         console.log(`[Latency] True Voice Latency (no filler): ${latencyMs}ms`);
-      }
-      
-      const latency = Date.now() - this.currentTurnStart;
-      if (this.callSid) {
-        logEvent(this.callSid, 'tts_first_byte', { latency, type: 'turn' });
       }
     } else if (this.currentTurnStart && !this.firstAudioLogged) {
       this.firstAudioLogged = true;
@@ -880,7 +999,7 @@ export class OpenAICompatLLM extends LLMProvider {
       stream: true,
       temperature: this.temperature,
       max_tokens: this.maxTokens,
-    });
+    }, { signal });
     for await (const chunk of s) {
       if (signal?.aborted) break;
       const t = chunk.choices[0]?.delta?.content || '';
@@ -935,7 +1054,6 @@ export class TwilioTelephony extends TelephonyProvider {
       from: this.fromNumber,
       url: `https://${this.domain}/voice`,
       machineDetection: machineDetection ? 'Enable' : undefined,
-      asyncAmd: machineDetection ? 'true' : undefined,
     });
     
     this.callContexts.set(call.sid, sanitizedContext);
@@ -961,6 +1079,17 @@ export class TwilioTelephony extends TelephonyProvider {
         const pipeline = this.pipelineFactory(context);
         const prewarmPromise = pipeline.prewarm();
         this.prewarmed.set(callSid, { pipeline, prewarmPromise });
+
+        // Memory leak cleanup: if WebSocket does not connect in 60s, clean up
+        setTimeout(() => {
+          if (this.prewarmed.has(callSid)) {
+            console.log(`[Cleanup] Cleaning up stale pre-warmed pipeline for CallSid: ${callSid}`);
+            const entry = this.prewarmed.get(callSid);
+            try { entry.pipeline.stop(); } catch {}
+            this.prewarmed.delete(callSid);
+          }
+          this.callContexts.delete(callSid);
+        }, 60000);
       }
 
       reply.type('text/xml').send(
@@ -1038,61 +1167,65 @@ export class TwilioTelephony extends TelephonyProvider {
       };
 
       ws.on('message', async (raw) => {
-        const data = JSON.parse(raw.toString());
+        try {
+          const data = JSON.parse(raw.toString());
 
-        if (data.event === 'start') {
-          const streamSid = data.start.streamSid;
-          callSid = data.start.callSid;
-          req.log.info({ streamSid, callSid }, 'call started');
+          if (data.event === 'start') {
+            const streamSid = data.start.streamSid;
+            callSid = data.start.callSid;
+            req.log.info({ streamSid, callSid }, 'call started');
 
-          const pre = this.prewarmed.get(callSid);
-          if (pre) {
-            pipeline = pre.pipeline;
-            toNumber = pipeline.agent?.context?.toNumber || 'unknown';
-            await pre.prewarmPromise;
-            this.prewarmed.delete(callSid);
-            this.callContexts.delete(callSid);
-            console.log(`[Pre-warm] Using pre-warmed pipeline for ${callSid}`);
-          } else {
-            const context = this.callContexts.get(callSid) || {};
-            toNumber = context.toNumber || 'unknown';
-            pipeline = this.pipelineFactory(context);
-            this.callContexts.delete(callSid);
-            await pipeline.prewarm();
+            const pre = this.prewarmed.get(callSid);
+            if (pre) {
+              pipeline = pre.pipeline;
+              toNumber = pipeline.agent?.context?.toNumber || 'unknown';
+              await pre.prewarmPromise;
+              this.prewarmed.delete(callSid);
+              this.callContexts.delete(callSid);
+              console.log(`[Pre-warm] Using pre-warmed pipeline for ${callSid}`);
+            } else {
+              const context = this.callContexts.get(callSid) || {};
+              toNumber = context.toNumber || 'unknown';
+              pipeline = this.pipelineFactory(context);
+              this.callContexts.delete(callSid);
+              await pipeline.prewarm();
+            }
+
+            // Log start call to observability
+            await startCall(callSid, toNumber, pipeline.agent?.name || 'unknown');
+
+            transport = new TwilioTransport(ws, streamSid);
+            
+            // Listen to outbound bot audio
+            transport.on('outboundMedia', (b64) => {
+              const audioChunk = Buffer.from(b64, 'base64');
+              botAudioBuffer = Buffer.concat([botAudioBuffer, audioChunk]);
+            });
+
+            pipeline.attachTransport(transport);
+            pipeline.start({ callSid, streamSid });
           }
 
-          // Log start call to observability
-          await startCall(callSid, toNumber, pipeline.agent?.name || 'unknown');
+          if (data.event === 'media' && pipeline && pipeline.isStarted) {
+            const audioChunk = Buffer.from(data.media.payload, 'base64');
+            customerAudioBuffer = Buffer.concat([customerAudioBuffer, audioChunk]);
 
-          transport = new TwilioTransport(ws, streamSid);
-          
-          // Listen to outbound bot audio
-          transport.on('outboundMedia', (b64) => {
-            const audioChunk = Buffer.from(b64, 'base64');
-            botAudioBuffer = Buffer.concat([botAudioBuffer, audioChunk]);
-          });
-
-          pipeline.attachTransport(transport);
-          pipeline.start({ callSid, streamSid });
-        }
-
-        if (data.event === 'media' && pipeline && pipeline.isStarted) {
-          const audioChunk = Buffer.from(data.media.payload, 'base64');
-          customerAudioBuffer = Buffer.concat([customerAudioBuffer, audioChunk]);
-
-          if (!firstMediaLogged && pipeline.startTime) {
-            firstMediaLogged = true;
-            console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);
+            if (!firstMediaLogged && pipeline.startTime) {
+              firstMediaLogged = true;
+              console.log(`[Net] Twilio→server first media: ${Date.now() - pipeline.startTime}ms`);
+            }
+            pipeline.handleIncomingAudio(data.media.payload);
           }
-          pipeline.handleIncomingAudio(data.media.payload);
-        }
 
-        if (data.event === 'mark' && transport) {
-          transport.emit('mark', data.mark?.name);
-        }
+          if (data.event === 'mark' && transport) {
+            transport.emit('mark', data.mark?.name);
+          }
 
-        if (data.event === 'stop') {
-          await finishCall();
+          if (data.event === 'stop') {
+            await finishCall();
+          }
+        } catch (parseErr) {
+          console.error('[TwilioTelephony] Error processing WebSocket message:', parseErr);
         }
       });
 
@@ -1210,6 +1343,7 @@ export class ElevenLabsTTS extends TTSProvider {
         console.log(`[TTS] Closed: ${c}`);
         if (!opened) resolve();
         if (!this.isClosedExplicitly && (c === 1006 || c === 1005)) {
+          this.queue = [];
           console.log('[TTS] Reconnecting in 1s...');
           setTimeout(() => this.connect(), 1000);
         }
@@ -1249,6 +1383,7 @@ export class ElevenLabsTTS extends TTSProvider {
 
   close() {
     this.isClosedExplicitly = true;
+    this.queue = [];
     try { this.ws?.close(); } catch {}
   }
 
@@ -1377,35 +1512,37 @@ export const linenGrassReminderAgent = {
 
 
   // ── Improved System Prompt ────────────────────────────
-  systemPrompt: (ctx) =>
-    `You are Krish, a friendly but concise assistant from LinenGrass calling ${ctx.hotelName}. ` +
-    `Your goal is to ensure ${ctx.contactName} places their daily linen order using the LinenGrass app.\n\n` +
+ systemPrompt: (ctx) =>
+    `You are Krish, a polite and friendly assistant from LinenGrass calling ${ctx.hotelName}. ` +
+    `You are having a natural, spoken conversation with ${ctx.contactName}. Your goal is to gently ensure they place their daily linen order using the LinenGrass app.\n\n` +
     
     `## CONTEXT\n` +
     `- Customer: ${ctx.contactName} at ${ctx.hotelName}\n` +
     `- Past Order (Only share if asked): Date: ${ctx.lastOrder?.date}, ID: ${ctx.lastOrder?.id}, Items: ${ctx.lastOrder?.products}\n` +
-    `- Order Deadline (Only share if asked when is the last time to order): 6 PM is the absolute deadline. Emphasize that ordering before 6 PM ensures the system can process it correctly and deliver the right linens.\n\n` +
+    `- Order Deadline: 6 PM. (Emphasize that ordering before 6 PM ensures the system can process it correctly and deliver the right linens).\n\n` +
     
     `## CONVERSATION FLOW\n` +
     `(Note: The system has already played the initial greeting. Do NOT repeat the greeting.)\n` +
     `1. **Check Order**: Ask if they have placed today's linen order yet. Wait for their answer.\n` +
     `2. **If ALREADY PLACED**: Acknowledge politely, remind them to use the LinenGrass app, say goodbye, and end.\n` +
-    `3. **If NOT PLACED YET**: Briefly explain that delayed orders affect supply. Ask for a specific time they will place it today.\n` +
+    `3. **If NOT PLACED YET**: Briefly mention that delayed orders affect supply. Ask for a specific time they will place it today.\n` +
     `4. **If THEY GIVE A TIME (e.g., "shaam tak", "in an hour")**: Acknowledge the time, remind them to use the LinenGrass app ONLY, say goodbye, and end. DO NOT ask again.\n` +
     `5. **Refusal**: If they refuse or are angry, apologize for the disturbance, ask them to place the order when ready, and say goodbye.\n\n` +
     
-    `## CRITICAL RULES\n` +
+    `## CRITICAL HUMAN-LIKE RULES\n` +
     `- **Language Detection**: If the user speaks ANY Hindi or Kannada words, you MUST reply in that language using native script (Devanagari for Hindi). ` +
     `For example, if the user says "mai aaj shaam tak kar dunga", you MUST reply in Hindi Devanagari script. Do not reply in English just because they said "thank you".\n` +
-    `- **Brevity**: Keep responses under 20 words. Do not use markdown or special characters.\n` +
-    `- **Pacing**: Ask ONE question at a time.\n` +
-    `- **Numbers**: Always speak numbers as words (e.g., "two" instead of "2").\n` +
-    `- **No Robotic Praise**: NEVER say "congratulations". Just acknowledge their commitment simply (e.g., "ठीक है, शाम तक LinenGrass ऐप पर ऑर्डर कर दें। धन्यवाद।").\n` +
+    `- **Natural Brevity**: Speak naturally in 1 to 2 short sentences. Do not use markdown, bullet points, or special characters.\n` +
+    `- **Pacing**: Ask ONE question at a time. Do not overwhelm the user with multiple questions.\n` +
+    `- **Numbers**: Always speak numbers as words (e.g., "two" instead of "2", "six PM" instead of "6 PM").\n` +
+    `- **Empathy over Praise**: NEVER say "congratulations". Acknowledge their commitment naturally and simply (e.g., "ठीक है, शाम तक LinenGrass ऐप पर ऑर्डर कर दें। धन्यवाद।").\n` +
     `- **No Loops**: If the user confirms the order is placed OR gives a time commitment, DO NOT ask again. Say goodbye and stop.\n` +
     `- **Identity**: You are an AI. You cannot transfer the call.`,
-  // Greeting played on call connect (Handled by TTS directly, LLM doesn't need to generate this)
+    
+  // Greeting played on call connect
   greeting: (ctx) =>
-    `Hi, this is Krish from LinenGrass. Is this ${ctx.contactName || 'the manager'}?`,
+    // Asking for the person first, then identifying yourself, is much more human.
+    `Hi, is this ${ctx.contactName || 'the manager'}? ... Great, this is Krish calling from LinenGrass.`,
 
   fillers: [
     'Hmm.',
@@ -1423,14 +1560,14 @@ export const linenGrassReminderAgent = {
       audioFormat: 'ulaw_8000',
       vadSilenceThresholdSecs: 1.10, // Increased to give users more time when taking pauses
       vadThreshold: 0.85,
-      minVolumeThreshold: 0.25,
+      minVolumeThreshold: 0.45,
     },
     tts: {
       name: 'elevenlabs',
       voiceId: process.env.ELEVENLABS_VOICE_ID,
       model: 'eleven_flash_v2_5',
       outputFormat: 'ulaw_8000',
-      speed: 0.90, // Slow down speaking pace (range: 0.7 to 1.2) for better Hindi clarity
+      speed: 1.0, 
     },
     llm: {
       name: 'openai-compat',
@@ -1512,7 +1649,7 @@ export const orderStatusAgent = {
       audioFormat: 'ulaw_8000',
       vadSilenceThresholdSecs: 1.50, // Increased to give users more time when taking pauses
       vadThreshold: 0.90,
-      minVolumeThreshold: 0.25,
+      minVolumeThreshold: 0.45,
     },
     tts: {
       name: 'elevenlabs',
@@ -1582,7 +1719,7 @@ export async function createServer({ telephony, port = 3000 }) {
   });
 
   // Twilio voice webhook (AMD + TwiML + pre-warm)
-  app.all('/voice', telephony.webhookHandler());
+  app.post('/voice', telephony.webhookHandler());
 
   // Trigger outbound call API endpoint
   app.post('/api/call', async (req, reply) => {
@@ -1699,23 +1836,24 @@ export async function extractCallOutcome(transcript) {
 
   try {
     const response = await client.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       temperature: 0,
-      max_tokens: 100,
+      max_tokens: 1000,
       response_format: { type: 'json_object' },
       messages: [
         {
           role: 'system',
-          content: `Analyze the phone call transcript. Identify the user's final commitment regarding placing their linen order. 
+          content: `Analyze the phone call transcript. Identify the user's final commitment regarding placing their daily linen order. 
 Return ONLY a JSON object with a "status" field and a "details" field.
 Status must be one of: "already_placed", "will_place_today", "no_requirement_today", "refused", "callback_requested", "busy_or_hangup", "wrong_number_or_person", "unknown".
 
 CRITICAL CLASSIFICATION RULES:
-1. Only set status to "will_place_today" or "already_placed" if the USER explicitly states, confirms, or agrees to it. 
-2. DO NOT attribute suggestions made by the bot (e.g., the bot asking "Will you order by evening?") as a user commitment unless the user explicitly confirms (e.g., "Yes", "I will", "Okay").
-3. If the user indicates they cannot hear, cannot understand, or if the conversation ends in confusion/audio issues without any commitment, classify status as "unknown" or "busy_or_hangup".
-4. If "will_place_today" or "callback_requested", extract the time/details in "details" (e.g., "evening", "1 hour", "shaam tak", "tomorrow at 10 AM"). 
-5. If "no_requirement_today", set "details" to "no requirement".`
+1. Handle Hindi/Hinglish Negations: Recognize phrases like "nako aaj", "aaj nahi chahiye", "zaroorat nahi hai", or "no requirement today" as "no_requirement_today". If the customer states they do not need linens today, prioritize this classification even if they politely acknowledge the bot with "Okay" or "Yeah" at the very end.
+2. Only set status to "will_place_today" or "already_placed" if the USER explicitly states, confirms, or agrees to it. 
+3. DO NOT attribute deadlines or times mentioned by the bot (e.g. "6 PM") to the user unless the user explicitly names or confirms that time themselves. Never assume or hallucinate a time like "before 6 PM" if the user did not say it.
+4. If the user indicates they cannot hear, cannot understand, or if the conversation ends in confusion/audio issues without any commitment, classify status as "unknown" or "busy_or_hangup".
+5. If "will_place_today" or "callback_requested", extract the time/details in "details" (e.g., "evening", "1 hour", "shaam tak", "tomorrow at 10 AM"). 
+6. If "no_requirement_today", set "details" to "no requirement".`
         },
         { role: 'user', content: transcriptText }
       ],
@@ -1797,14 +1935,18 @@ export async function startCall(callSid, toNumber, agentName, timestamp = new Da
 
 export async function endCall(callSid, duration, recordingUrl, transcript, totalCost, costBreakdown) {
   console.log(`[Observability] endCall: ${callSid}, duration: ${duration}, url: ${recordingUrl}, cost: ${totalCost}`);
+  
+  const serializedTranscript = JSON.stringify(transcript);
+  const serializedCostBreakdown = JSON.stringify(costBreakdown);
+
   const event = {
     type: 'end_call',
     callSid,
     durationSecs: duration,
     recordingUrl,
-    transcript,
+    transcript: serializedTranscript,
     totalCost,
-    costBreakdown,
+    costBreakdown: serializedCostBreakdown,
     endedAt: new Date().toISOString()
   };
   broadcast(event);
@@ -1815,7 +1957,7 @@ export async function endCall(callSid, duration, recordingUrl, transcript, total
       `UPDATE calls 
        SET status = 'completed', ended_at = NOW(), duration_secs = $1, recording_url = $2, transcript = $3, total_cost = $4, cost_breakdown = $5
        WHERE call_sid = $6`,
-      [duration, recordingUrl, JSON.stringify(transcript), totalCost, JSON.stringify(costBreakdown), callSid]
+      [duration, recordingUrl, serializedTranscript, totalCost, serializedCostBreakdown, callSid]
     );
   } catch (err) {
     console.error('Error updating call in DB:', err);

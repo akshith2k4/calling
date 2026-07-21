@@ -60,14 +60,18 @@ export async function startCall(callSid, toNumber, agentName, timestamp = new Da
 
 export async function endCall(callSid, duration, recordingUrl, transcript, totalCost, costBreakdown) {
   console.log(`[Observability] endCall: ${callSid}, duration: ${duration}, url: ${recordingUrl}, cost: ${totalCost}`);
+  
+  const serializedTranscript = JSON.stringify(transcript);
+  const serializedCostBreakdown = JSON.stringify(costBreakdown);
+
   const event = {
     type: 'end_call',
     callSid,
     durationSecs: duration,
     recordingUrl,
-    transcript,
+    transcript: serializedTranscript,
     totalCost,
-    costBreakdown,
+    costBreakdown: serializedCostBreakdown,
     endedAt: new Date().toISOString()
   };
   broadcast(event);
@@ -78,7 +82,7 @@ export async function endCall(callSid, duration, recordingUrl, transcript, total
       `UPDATE calls 
        SET status = 'completed', ended_at = NOW(), duration_secs = $1, recording_url = $2, transcript = $3, total_cost = $4, cost_breakdown = $5
        WHERE call_sid = $6`,
-      [duration, recordingUrl, JSON.stringify(transcript), totalCost, JSON.stringify(costBreakdown), callSid]
+      [duration, recordingUrl, serializedTranscript, totalCost, serializedCostBreakdown, callSid]
     );
   } catch (err) {
     console.error('Error updating call in DB:', err);

@@ -21,12 +21,10 @@ export class FillerManager {
   }
 
   getRandom(exclude) {
-    if (this.fillers.length < 2) return this.fillers[0];
-    let pick;
-    do {
-      pick = this.fillers[Math.floor(Math.random() * this.fillers.length)];
-    } while (pick === exclude);
-    return pick;
+    if (!this.fillers || this.fillers.length === 0) return undefined;
+    const available = this.fillers.filter(f => f !== exclude);
+    if (available.length === 0) return this.fillers[0];
+    return available[Math.floor(Math.random() * available.length)];
   }
 
   get(text) {

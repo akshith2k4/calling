@@ -19,7 +19,7 @@ export async function createServer({ telephony, port = 3000 }) {
   });
 
   // Twilio voice webhook (AMD + TwiML + pre-warm)
-  app.all('/voice', telephony.webhookHandler());
+  app.post('/voice', telephony.webhookHandler());
 
   // Trigger outbound call API endpoint
   app.post('/api/call', async (req, reply) => {

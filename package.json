@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "call": "node src/index.js --call",
-    "tunnel": "npx ngrok http 3000 --url spied-unlovable-playable.ngrok-free.dev"
+    "tunnel": "npx ngrok http 3000 --url spied-unlovable-playable.ngrok-free.dev",
+    "simulate": "node src/simulate.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1089.0",
